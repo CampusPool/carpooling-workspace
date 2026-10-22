@@ -8,7 +8,10 @@
 /storage/
 /bootstrap/cache/
 *.log
-*.sql
+/backups/
+/dumps/
+*.sql.gz
+*.dump
 *.sqlite*
 *.db
 .DS_Store

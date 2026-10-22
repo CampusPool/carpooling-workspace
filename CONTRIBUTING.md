@@ -11,3 +11,5 @@
 Arjun (`arjunsrikanthh`, also `noqtar`) coordinates integration; Zayaan (`zayaan-06`) owns UI integration; Nikhil (`NikhilJoshi441`) owns search/matching; Nithesh (`NitheshMogaveer777`) owns database integrity/lifecycle verification. These are responsibilities, not claims of prior authorship. Course-specific team eligibility and contributions require instructor confirmation.
 
 Never commit credentials, personal records, private trip coordinates, DB dumps, reference-app artifacts or code whose redistribution obligations are unresolved. Retain original notices and separate upstream code from subsequent modifications.
+
+Current package boundaries, source/license gates and demo instructions are being reviewed in [official PR #45](https://github.com/CampusPool/carpooling/pull/45). Review the five consolidated documents there before starting; the application baseline is still withheld. Plain SQL migrations and assessed queries may be tracked after authorization; database dumps/backups must stay excluded.
