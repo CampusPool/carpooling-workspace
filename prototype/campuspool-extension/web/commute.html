@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1557f5">
+  <title>Mobility · Your campus commute</title>
+  <link rel="stylesheet" href="/mobility/commute.css">
+</head>
+<body>
+  <main class="app-shell" id="app">
+    <section class="auth-screen" id="auth-screen" aria-labelledby="auth-title">
+      <div class="welcome-hero">
+        <a class="wordmark" href="/mobility/" aria-label="Mobility home"><span class="brand-symbol">m</span>mobility<span class="wordmark-dot">•</span></a>
+        <div class="welcome-copy"><span class="eyebrow">PES COMMUNITY · BENGALURU</span><h1 id="auth-title">Your campus.<br>Your people.<br><span>Your ride.</span></h1><p>A little company for your everyday commute.</p></div>
+        <div class="welcome-road" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+        <svg class="welcome-car" viewBox="0 0 260 135" aria-hidden="true"><ellipse cx="133" cy="120" rx="108" ry="10" fill="#123db8" opacity=".35"/><path d="M39 66 68 26q5-7 16-7h75q11 0 19 10l32 37 27 10q9 3 9 16v16H17V87q0-13 22-21Z" fill="#d9ebff"/><path d="m76 30-23 35h127l-25-35Z" fill="#8cb8ff"/><path d="M116 30v35m49-26 18 26" stroke="#d9ebff" stroke-width="6"/><path d="M18 82h227v22H18Z" fill="#9ec5ff"/><path d="m22 79 28 4v12H20m224-17-28 5v12h30" fill="white"/><rect x="106" y="88" width="63" height="12" rx="5" fill="#1557f5"/><circle cx="65" cy="106" r="23" fill="#16315e"/><circle cx="65" cy="106" r="11" fill="#eef5ff"/><circle cx="203" cy="106" r="23" fill="#16315e"/><circle cx="203" cy="106" r="11" fill="#eef5ff"/></svg>
+      </div>
+      <div class="welcome-panel">
+        <span class="section-kicker">LET’S GET YOU THERE</span><h2>How are you travelling?</h2><p class="muted">Choose a mode. You can change it in Account.</p>
+        <div id="demo-actions" class="demo-actions">
+          <button class="mode-entry" data-demo-role="rider" type="button"><span class="mode-entry-icon" aria-hidden="true">↗</span><span><strong>I need a ride</strong><small>Find a seat for your campus commute</small></span><span class="entry-arrow" aria-hidden="true">→</span></button>
+          <button class="mode-entry" data-demo-role="driver" type="button"><span class="mode-entry-icon driver" aria-hidden="true">⌁</span><span><strong>I’m driving</strong><small>Manage ride requests and your trips</small></span><span class="entry-arrow" aria-hidden="true">→</span></button>
+        </div>
+        <p class="demo-disclaimer"><span></span>Demo access · no OTP needed · no real money</p>
+        <p class="status" id="auth-status" role="status" aria-live="polite"></p>
+        <p class="welcome-note"><a href="/mobility/?demo=campus-route">Open Yeshwanthpur driver / Laggere rider accounts</a></p>
+        <p class="welcome-note">College email sign-in will be connected later.</p>
+        <div class="hidden" aria-hidden="true"><form id="auth-form"><input id="college-email" type="email" autocomplete="username"></form><form id="otp-form"><input id="otp-code" maxlength="6" autocomplete="one-time-code"></form></div>
+      </div>
+    </section>
+
+    <section class="product hidden" id="product-screen" data-view="home">
+      <header class="app-header" id="app-header">
+        <button class="identity-button" id="profile-button" type="button" aria-label="Open account"><span class="avatar" id="avatar-text">R</span><span class="mode-badge" id="mode-label">Rider</span></button>
+        <div class="header-brand"><strong>mobility<span>•</span></strong><small>PES community</small></div>
+        <div class="header-actions"><button class="icon-button" id="wallet-button" type="button" aria-label="Open demo wallet"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V5H5a2 2 0 0 0-2 2v12h18V8H5a1 1 0 0 1 0-2"/><path d="M21 12h-6v4h6"/><path d="M17.5 14h.1"/></svg></button><button class="icon-button" id="activity-button" type="button" aria-label="Open ride updates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg><span class="activity-count hidden" id="activity-count">0</span></button></div>
+      </header>
+      <span id="page-title" class="sr-only">Your rides</span>
+      <div id="view-home" class="view"></div>
+      <div id="view-rides" class="view hidden"></div>
+      <div id="view-wallet" class="view hidden"></div>
+      <div id="view-chats" class="view hidden"></div>
+      <div id="view-settings" class="view hidden"></div>
+      <nav class="bottom-nav" id="bottom-nav" aria-label="Main navigation">
+        <button data-nav="home" class="active" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-8 9 8v11h-6v-7H9v7H3Z"/></svg><span>Home</span></button>
+        <button data-nav="chats" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a9 9 0 0 1-9 9c-2 0-4-.7-5-1L2 21l2-5a9 9 0 1 1 17-5Z"/><path d="M8 11h.1m4 0h.1m4 0h.1"/></svg><span>Chats</span></button>
+        <button data-nav="settings" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="7" r="4"/><path d="M3 22a9 9 0 0 1 18 0"/></svg><span>Account</span></button>
+      </nav>
+      <p class="demo-ribbon" id="demo-banner">Demo rides & credits · no real money</p>
+    </section>
+    <div id="sheet-root"></div>
+    <div class="toast hidden" id="app-toast" role="status" aria-live="polite"></div>
+  </main>
+  <script type="module" src="/mobility/commute.mjs"></script>
+</body>
+</html>

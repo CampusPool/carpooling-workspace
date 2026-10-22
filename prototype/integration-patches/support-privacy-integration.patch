@@ -1,0 +1,49 @@
+diff --git a/app/Http/Controllers/Api/v1/SupportTicketController.php b/app/Http/Controllers/Api/v1/SupportTicketController.php
+index db5c7c6..a6e743f 100644
+--- a/app/Http/Controllers/Api/v1/SupportTicketController.php
++++ b/app/Http/Controllers/Api/v1/SupportTicketController.php
+@@ -30,7 +30,7 @@ class SupportTicketController extends Controller
+         $user = auth()->user();
+         $tickets = SupportTicket::where('user_id', $user->id)->orderByDesc('id')->get();
+ 
+-        return response()->json(['data' => $tickets]);
++        return response()->json(['data' => $tickets->each(fn (SupportTicket $ticket) => $ticket->makeHidden(['internal_note_markdown']))]);
+     }
+ 
+     public function show(int $id): JsonResponse
+@@ -43,7 +43,7 @@ class SupportTicketController extends Controller
+             return response()->json(['error' => 'Ticket not found'], 404);
+         }
+ 
+-        return response()->json(['data' => $ticket]);
++        return response()->json(['data' => $ticket->makeHidden(['internal_note_markdown'])]);
+     }
+ 
+     public function create(Request $request): JsonResponse
+@@ -70,7 +70,7 @@ class SupportTicketController extends Controller
+             $validated['message_markdown'],
+         );
+         if ($existingDuplicate) {
+-            return response()->json(['data' => $existingDuplicate->fresh()]);
++            return response()->json(['data' => $existingDuplicate->fresh()->makeHidden(['internal_note_markdown'])]);
+         }
+ 
+         [$ticket, $addedOpeningAutoReply] = DB::transaction(function () use ($validated, $user) {
+@@ -108,7 +108,7 @@ class SupportTicketController extends Controller
+             $this->notifyTicketOwnerOfAdminReply($ticket, $user);
+         }
+ 
+-        return response()->json(['data' => $ticket]);
++        return response()->json(['data' => $ticket->makeHidden(['internal_note_markdown'])]);
+     }
+ 
+     private function findExistingTicketWithSameOpening(int $userId, string $subject, string $messageMarkdown): ?SupportTicket
+@@ -167,7 +167,7 @@ class SupportTicketController extends Controller
+             $ticket->save();
+         });
+ 
+-        return response()->json(['data' => $ticket->fresh()]);
++        return response()->json(['data' => $ticket->fresh()->makeHidden(['internal_note_markdown'])]);
+     }
+ 
+     public function close(int $id): JsonResponse

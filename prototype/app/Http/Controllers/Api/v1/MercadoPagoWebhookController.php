@@ -1,0 +1,1064 @@
+<?php
+
+namespace STS\Http\Controllers\Api\v1;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Log;
+use MercadoPago\Client\Payment\PaymentClient;
+use MercadoPago\MercadoPagoConfig;
+use STS\Http\Controllers\Controller;
+use STS\Jobs\ReconcileClubSubscriptionInvoiceJob;
+use STS\Jobs\ReconcileClubSubscriptionPaymentJob;
+use STS\Models\Campaign;
+use STS\Models\CampaignDonation;
+use STS\Models\DonationSubscription;
+use STS\Models\ManualIdentityValidation;
+use STS\Models\PaymentAttempt;
+use STS\Models\Trip;
+use STS\Services\FriendTripAlertService;
+use STS\Services\IdentityVerificationOutcome;
+use STS\Services\Logic\ConversationsManager;
+use STS\Services\Logic\TripsManager;
+use STS\Services\MercadoPagoService;
+use STS\Services\PlatformDonationService;
+
+class MercadoPagoWebhookController extends Controller
+{
+    protected $tripLogic;
+
+    protected $conversationManager;
+
+    protected $paymentClient;
+
+    protected $mercadoPagoService;
+
+    protected $platformDonationService;
+
+    public function __construct(
+        TripsManager $tripLogic,
+        ConversationsManager $conversationManager,
+        MercadoPagoService $mercadoPagoService,
+        PlatformDonationService $platformDonationService
+    ) {
+        $this->tripLogic = $tripLogic;
+        $this->conversationManager = $conversationManager;
+        $this->mercadoPagoService = $mercadoPagoService;
+        $this->platformDonationService = $platformDonationService;
+
+        // Initialize Mercado Pago SDK
+        MercadoPagoConfig::setAccessToken(config('services.mercadopago.access_token'));
+        $this->paymentClient = new PaymentClient;
+    }
+
+    public function handle(Request $request)
+    {
+        Log::info('MercadoPago webhook received', [
+            'type' => $request->query('type') ?? $request->input('type'),
+            'action' => $request->input('action'),
+            'data.id' => $this->signedWebhookDataId($request) ?? $this->webhookResourceId($request),
+        ]);
+
+        // Handle order.processed (QR/Orders API) - sent when QR order is paid
+        if ($request->input('action') === 'order.processed') {
+            try {
+                return $this->handleOrderProcessed($request);
+            } catch (\Throwable $e) {
+                Log::error('MercadoPago order.processed webhook failed', [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return response()->json(['error' => 'Internal error'], 500);
+            }
+        }
+
+        $webhookType = $request->query('type') ?? $request->input('type');
+        if ($webhookType === 'topic_merchant_order_wh') {
+            try {
+                return $this->handleMerchantOrderWebhook($request);
+            } catch (\Throwable $e) {
+                Log::error('MercadoPago merchant order webhook failed', [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return response()->json(['error' => 'Internal error'], 500);
+            }
+        }
+
+        $action = $request->input('action');
+
+        if ($webhookType === 'subscription_preapproval' || $action === 'subscription_preapproval') {
+            try {
+                return $this->handleSubscriptionPreapprovalWebhook($request);
+            } catch (\Throwable $e) {
+                Log::error('MercadoPago subscription_preapproval webhook failed', [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return response()->json(['error' => 'Internal error'], 500);
+            }
+        }
+
+        if ($webhookType === 'subscription_authorized_payment' || $action === 'subscription_authorized_payment') {
+            try {
+                return $this->handleSubscriptionAuthorizedPaymentWebhook($request);
+            } catch (\Throwable $e) {
+                Log::error('MercadoPago subscription_authorized_payment webhook failed', [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return response()->json(['error' => 'Internal error'], 500);
+            }
+        }
+
+        if (! in_array($action, ['payment.created', 'payment.updated'], true)) {
+            return response()->json(['status' => 'success']);
+        }
+
+        $paymentId = $this->webhookResourceId($request);
+        if ($action === 'payment.updated' && empty($paymentId)) {
+            return response()->json(['status' => 'success']);
+        }
+
+        // Verify the request is from Mercado Pago
+        if (! $this->verifyMercadoPagoRequest($request)) {
+            Log::error('Invalid MercadoPago webhook request');
+
+            return response()->json(['error' => 'Invalid request'], 400);
+        }
+        if (! $paymentId) {
+            Log::error('No payment ID in webhook request');
+
+            return response()->json(['error' => 'No payment ID'], 400);
+        }
+        // Get the payment status from Mercado Pago
+        $mpPayment = $this->getMercadoPagoPayment($paymentId);
+        if (! $mpPayment) {
+            Log::error('Could not fetch payment from MercadoPago', ['payment_id' => $paymentId]);
+
+            return response()->json(['error' => 'Could not fetch payment'], 500);
+        }
+        $externalReference = $mpPayment['external_reference'] ?? '';
+
+        // manual_validation:requestId (Checkout Pro) or manual_validation_requestId (QR - Orders API allows no colon)
+        if (strpos($externalReference, 'manual_validation:') === 0 || strpos($externalReference, 'manual_validation_') === 0) {
+            return $this->handleManualValidationPayment($mpPayment);
+        }
+
+        if ($this->isDonationOnceQrExternalReference($externalReference)) {
+            return $this->handleDonationOnceQrPayment($mpPayment);
+        }
+
+        if ($externalReference !== '') {
+            $decodedReference = $this->parseExternalReference($externalReference);
+
+            if (! $decodedReference) {
+                Log::error('Failed to parse external reference', ['external_reference' => $externalReference]);
+
+                return response()->json(['error' => 'Invalid external reference'], 400);
+            }
+
+            if (stripos($decodedReference, 'sellado') !== false) {
+                if ($action !== 'payment.created') {
+                    return response()->json(['status' => 'success']);
+                }
+
+                return $this->handleTripPayment($mpPayment);
+            } elseif (stripos($decodedReference, 'campaña') !== false) {
+                if ($action !== 'payment.created') {
+                    return response()->json(['status' => 'success']);
+                }
+
+                return $this->handleCampaignDonation($mpPayment);
+            } elseif (stripos($decodedReference, 'plataforma') !== false) {
+                return $this->handlePlatformDonationPayment($mpPayment);
+            }
+
+            Log::error('Unknown payment type in external reference', ['external_reference' => $externalReference, 'decoded_reference' => $decodedReference]);
+
+            return response()->json(['error' => 'Unknown payment type'], 400);
+        }
+
+        $preapprovalId = $this->resolveClubPreapprovalIdFromPayment($mpPayment);
+        if ($preapprovalId && DonationSubscription::query()->where('mp_preapproval_id', $preapprovalId)->exists()) {
+            $this->platformDonationService->handleSubscriptionAuthorizedPayment($mpPayment);
+
+            return response()->json(['status' => 'success']);
+        }
+
+        if ($this->looksLikeClubSubscriptionPayment($mpPayment)) {
+            if ($this->platformDonationService->handleClubSubscriptionPaymentViaInvoiceSearch($mpPayment, (string) $paymentId)) {
+                return response()->json(['status' => 'success']);
+            }
+
+            ReconcileClubSubscriptionPaymentJob::dispatch((string) $paymentId);
+
+            return response()->json(['status' => 'success']);
+        }
+
+        Log::info('Unreferenced MercadoPago payment ignored', [
+            'payment_id' => $paymentId,
+            'preapproval_id' => $preapprovalId,
+            'point_of_interaction_type' => $this->pointOfInteractionType($mpPayment),
+            'description' => $mpPayment['description'] ?? null,
+        ]);
+
+        return response()->json(['status' => 'success']);
+    }
+
+    /**
+     * Parse and verify external reference from MercadoPago payment
+     * Returns decoded reference string or null if invalid
+     */
+    protected function parseExternalReference($externalReference)
+    {
+        // Check if it's a hashed reference (new format)
+        if (strpos($externalReference, ':') !== false) {
+            // Split hash and encoded data
+            $parts = explode(':', $externalReference, 2);
+            if (count($parts) !== 2) {
+                Log::error('Invalid external reference format', ['external_reference' => $externalReference]);
+
+                return null;
+            }
+
+            $hash = $parts[0];
+            $encodedData = $parts[1];
+
+            // Verify hash
+            $referenceString = base64_decode($encodedData);
+            $salt = config('services.mercadopago.reference_salt', 'carpoolear_2024_secure_salt');
+            $expectedHash = hash('sha256', $referenceString.$salt);
+
+            if (! hash_equals($hash, $expectedHash)) {
+                Log::error('Invalid external reference hash', [
+                    'external_reference' => $externalReference,
+                    'calculated_hash' => $expectedHash,
+                    'received_hash' => $hash,
+                ]);
+
+                return null;
+            }
+
+            return $referenceString;
+        }
+
+        // Legacy format (plain text) - return as is
+        return $externalReference;
+    }
+
+    /**
+     * Query id Mercado Pago signed in x-signature (`data.id` or `data_id`).
+     * Body ids are not used here — only the query string MP HMAC'd.
+     */
+    protected function signedWebhookDataId(Request $request): ?string
+    {
+        $dataId = $request->query->get('data.id')
+            ?? $request->query('data.id')
+            ?? $request->query('data_id')
+            ?? $request->query->get('data_id');
+
+        if ($dataId === null || $dataId === '') {
+            return null;
+        }
+
+        return (string) $dataId;
+    }
+
+    /**
+     * Resource id for fetching a payment or preapproval.
+     * Prefer the signed query id; fall back to body `data.id` / `data_id`.
+     */
+    protected function webhookResourceId(Request $request): ?string
+    {
+        $signedId = $this->signedWebhookDataId($request);
+        if ($signedId !== null) {
+            return $signedId;
+        }
+
+        $bodyId = $request->input('data.id')
+            ?? $request->input('data_id')
+            ?? data_get($request->all(), 'data.id');
+
+        if ($bodyId === null || $bodyId === '') {
+            return null;
+        }
+
+        return (string) $bodyId;
+    }
+
+    /**
+     * Verify webhook signature from MercadoPago.
+     *
+     * @param  bool  $isOrderWebhook  True for Orders API (QR), false for Payments API (Checkout Pro / Sellado).
+     *                                Orders API uses data.id in query (lowercased); Payments/subscriptions use
+     *                                query data.id or data_id (the id MP signed).
+     * @param  array<int, string>|null  $secretCandidates  Secrets to try, in order. Defaults from webhook type.
+     */
+    protected function verifyMercadoPagoRequest(Request $request, bool $isOrderWebhook = false, ?array $secretCandidates = null)
+    {
+        $xSignature = $request->header('x-signature');
+        $xRequestId = $request->header('x-request-id');
+
+        if ($isOrderWebhook) {
+            // Orders API (QR): data.id from query params (per MP docs), fallback to body if absent
+            $dataId = $request->query('data.id')
+                ?? $request->input('data_id')
+                ?? $request->input('data.id');
+            $dataId = $dataId ? strtolower($dataId) : null;
+        } else {
+            $dataId = $this->signedWebhookDataId($request);
+        }
+
+        if (! $xSignature || ! $xRequestId || ! $dataId) {
+            Log::error('Missing required headers or parameters in webhook request', [
+                'has_signature' => ! empty($xSignature),
+                'has_request_id' => ! empty($xRequestId),
+                'has_data_id' => ! empty($dataId),
+            ]);
+
+            return false;
+        }
+
+        // Parse x-signature to get ts and v1 values
+        $parts = explode(',', $xSignature);
+        $ts = null;
+        $hash = null;
+
+        foreach ($parts as $part) {
+            $keyValue = explode('=', $part, 2);
+            if (count($keyValue) == 2) {
+                $key = trim($keyValue[0]);
+                $value = trim($keyValue[1]);
+                if ($key === 'ts') {
+                    $ts = $value;
+                } elseif ($key === 'v1') {
+                    $hash = $value;
+                }
+            }
+        }
+
+        if (! $ts || ! $hash) {
+            Log::error('Invalid x-signature format', ['signature' => $xSignature]);
+
+            return false;
+        }
+
+        // Generate the manifest string
+        $manifest = "id:{$dataId};request-id:{$xRequestId};ts:{$ts};";
+
+        if ($secretCandidates === null) {
+            $secretCandidates = $this->webhookSecretCandidatesForRequest($request, $isOrderWebhook);
+        }
+        $secretCandidates = array_values(array_filter($secretCandidates));
+
+        if ($secretCandidates === []) {
+            Log::error('Mercado Pago webhook secret not configured');
+
+            return false;
+        }
+
+        $lastCalculatedHash = null;
+        foreach ($secretCandidates as $secret) {
+            $calculatedHash = hash_hmac('sha256', $manifest, $secret);
+            $lastCalculatedHash = $calculatedHash;
+            if (hash_equals($calculatedHash, $hash)) {
+                return true;
+            }
+        }
+
+        Log::error('Invalid webhook signature', [
+            'calculated' => $lastCalculatedHash,
+            'received' => $hash,
+        ]);
+
+        return false;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    protected function webhookSecretCandidatesForRequest(Request $request, bool $isOrderWebhook): array
+    {
+        $standard = config('services.mercadopago.webhook_secret');
+        $qr = config('services.mercadopago.webhook_secret_qr_payment');
+
+        if ($isOrderWebhook) {
+            return array_values(array_filter([$qr]));
+        }
+
+        if ($this->isQrPaymentApplicationWebhook($request)) {
+            return array_values(array_filter(array_unique([$qr, $standard])));
+        }
+
+        return array_values(array_filter(array_unique([$standard, $qr])));
+    }
+
+    /**
+     * QR manual-validation payments use a separate MP application.
+     * Webhook body includes application_id which matches MERCADO_PAGO_QR_PAYMENT_CLIENT_ID
+     * (or MERCADO_PAGO_QR_PAYMENT_APPLICATION_ID when set).
+     */
+    protected function isQrPaymentApplicationWebhook(Request $request): bool
+    {
+        $applicationId = (string) ($request->input('application_id') ?? '');
+        if ($applicationId === '') {
+            return false;
+        }
+
+        $qrApplicationId = (string) (
+            config('services.mercadopago.qr_payment_application_id')
+            ?: config('services.mercadopago.qr_payment_client_id')
+            ?: ''
+        );
+
+        return $qrApplicationId !== '' && $applicationId === $qrApplicationId;
+    }
+
+    protected function isManualValidationExternalReference(string $externalReference): bool
+    {
+        return strpos($externalReference, 'manual_validation:') === 0
+            || strpos($externalReference, 'manual_validation_') === 0;
+    }
+
+    protected function isDonationOnceQrExternalReference(string $externalReference): bool
+    {
+        return str_starts_with($externalReference, 'donation_once_');
+    }
+
+    protected function routeAccreditedQrCompatiblePayment(string $externalReference, mixed $paymentId, string $statusDetail)
+    {
+        $approvedPayload = [
+            'id' => $paymentId,
+            'status' => 'approved',
+            'status_detail' => $statusDetail,
+            'external_reference' => $externalReference,
+        ];
+
+        if ($this->isManualValidationExternalReference($externalReference)) {
+            return $this->handleManualValidationPayment($approvedPayload);
+        }
+
+        if ($this->isDonationOnceQrExternalReference($externalReference)) {
+            return $this->handleDonationOnceQrPayment($approvedPayload);
+        }
+
+        return response()->json(['status' => 'success']);
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    protected function handleDonationOnceQrPayment(array $mpPayment)
+    {
+        $externalReference = $mpPayment['external_reference'] ?? '';
+        try {
+            $handled = $this->platformDonationService->handleQrOnceOrder($externalReference, $mpPayment);
+        } catch (\Throwable $e) {
+            Log::error('Failed to handle donation QR payment', [
+                'payment_id' => $mpPayment['id'] ?? null,
+                'message' => $e->getMessage(),
+            ]);
+
+            return response()->json(['error' => 'Failed to process platform donation'], 500);
+        }
+
+        if (! $handled) {
+            return response()->json(['error' => 'Invalid external reference'], 400);
+        }
+
+        return response()->json(['status' => 'success']);
+    }
+
+    protected function getMercadoPagoPayment($paymentId)
+    {
+        try {
+            // Use the SDK client to fetch payment details
+            $payment = $this->paymentClient->get($paymentId);
+
+            if (! $payment) {
+                Log::error('Payment not found in MercadoPago', ['payment_id' => $paymentId]);
+
+                return null;
+            }
+
+            $content = $payment->getResponse()?->getContent();
+            $decoded = is_array($content) ? $content : json_decode((string) $content, true);
+
+            if (is_array($decoded) && isset($decoded['id'])) {
+                $metadata = $decoded['metadata'] ?? null;
+
+                return [
+                    'id' => $decoded['id'],
+                    'status' => $decoded['status'] ?? 'pending',
+                    'status_detail' => $decoded['status_detail'] ?? null,
+                    'transaction_amount' => $decoded['transaction_amount'] ?? ($decoded['amount'] ?? 0),
+                    'amount' => $decoded['transaction_amount'] ?? ($decoded['amount'] ?? 0),
+                    'currency_id' => $decoded['currency_id'] ?? null,
+                    'payment_method_id' => $decoded['payment_method_id'] ?? null,
+                    'payment_type_id' => $decoded['payment_type_id'] ?? null,
+                    'external_reference' => $decoded['external_reference'] ?? '',
+                    'preapproval_id' => $decoded['preapproval_id'] ?? null,
+                    'metadata' => is_array($metadata) ? $metadata : null,
+                    'description' => $decoded['description'] ?? null,
+                    'point_of_interaction' => is_array($decoded['point_of_interaction'] ?? null)
+                        ? $decoded['point_of_interaction']
+                        : null,
+                    'date_created' => $decoded['date_created'] ?? null,
+                    'date_approved' => $decoded['date_approved'] ?? null,
+                    'date_last_updated' => $decoded['date_last_updated'] ?? null,
+                ];
+            }
+
+            return [
+                'id' => $payment->id,
+                'status' => $payment->status,
+                'status_detail' => $payment->status_detail,
+                'transaction_amount' => $payment->transaction_amount,
+                'amount' => $payment->transaction_amount,
+                'currency_id' => $payment->currency_id,
+                'payment_method_id' => $payment->payment_method_id,
+                'payment_type_id' => $payment->payment_type_id,
+                'external_reference' => $payment->external_reference,
+                'preapproval_id' => null,
+                'metadata' => null,
+                'description' => $payment->description,
+                'point_of_interaction' => null,
+                'date_created' => $payment->date_created,
+                'date_approved' => $payment->date_approved,
+                'date_last_updated' => $payment->date_last_updated,
+            ];
+        } catch (\Exception $e) {
+            $apiResponse = method_exists($e, 'getApiResponse') ? $e->getApiResponse() : null;
+            Log::error('Error fetching MercadoPago payment', [
+                'payment_id' => $paymentId,
+                'error' => $e->getMessage(),
+                'api_response' => $apiResponse ? $apiResponse->getContent() : 'No API response',
+            ]);
+
+            return null;
+        }
+    }
+
+    protected function updatePaymentStatus(PaymentAttempt $payment, $mpPayment)
+    {
+        $oldStatus = $payment->payment_status;
+        $newStatus = $this->mapMercadoPagoStatusToPaymentAttemptStatus($mpPayment['status']);
+
+        if ($oldStatus === $newStatus) {
+            return $newStatus;
+        }
+
+        $payment->payment_status = $newStatus;
+        $payment->payment_data = array_merge($payment->payment_data ?? [], [
+            'mp_status' => $mpPayment['status'],
+            'mp_status_detail' => $mpPayment['status_detail'],
+            'mp_payment_method' => $mpPayment['payment_method_id'],
+            'mp_payment_type' => $mpPayment['payment_type_id'],
+            'mp_currency' => $mpPayment['currency_id'],
+            'mp_amount' => $mpPayment['amount'],
+            'mp_date_created' => $mpPayment['date_created'],
+            'mp_date_approved' => $mpPayment['date_approved'],
+            'mp_date_updated' => $mpPayment['date_last_updated'],
+            'last_webhook' => now()->toIso8601String(),
+        ]);
+
+        if ($newStatus === PaymentAttempt::STATUS_COMPLETED) {
+            $payment->paid_at = now();
+        }
+
+        $payment->save();
+
+        return $newStatus;
+    }
+
+    protected function updateTripStatus(Trip $trip, $paymentStatus)
+    {
+        if ($paymentStatus === PaymentAttempt::STATUS_COMPLETED) {
+            $trip->setStateReady()->save();
+            app(FriendTripAlertService::class)->notifyIfVisible($trip->fresh());
+        } elseif ($paymentStatus === PaymentAttempt::STATUS_FAILED) {
+            $trip->setStatePaymentFailed()->save();
+        } elseif ($paymentStatus === PaymentAttempt::STATUS_PENDING) {
+            $trip->setStateAwaitingPayment()->save();
+        }
+    }
+
+    protected function mapMercadoPagoStatusToPaymentAttemptStatus($mpStatus)
+    {
+        $statusMap = [
+            'approved' => PaymentAttempt::STATUS_COMPLETED,
+            'rejected' => PaymentAttempt::STATUS_FAILED,
+            'pending' => PaymentAttempt::STATUS_PENDING,
+            'in_process' => PaymentAttempt::STATUS_PENDING,
+            'cancelled' => PaymentAttempt::STATUS_FAILED,
+            'refunded' => PaymentAttempt::STATUS_FAILED,
+            'in_mediation' => PaymentAttempt::STATUS_PENDING,
+            'charged_back' => PaymentAttempt::STATUS_FAILED,
+        ];
+
+        return $statusMap[$mpStatus] ?? PaymentAttempt::STATUS_PENDING;
+    }
+
+    protected function mapMercadoPagoStatusToTripState($mpStatus)
+    {
+        $statusMap = [
+            'approved' => Trip::STATE_READY,
+            'rejected' => Trip::STATE_PAYMENT_FAILED,
+            'pending' => Trip::STATE_PENDING_PAYMENT,
+            'in_process' => Trip::STATE_PENDING_PAYMENT,
+            'cancelled' => Trip::STATE_PAYMENT_FAILED,
+            'refunded' => Trip::STATE_PAYMENT_FAILED,
+            'in_mediation' => Trip::STATE_PENDING_PAYMENT,
+            'charged_back' => Trip::STATE_PAYMENT_FAILED,
+        ];
+
+        return $statusMap[$mpStatus] ?? Trip::STATE_PENDING_PAYMENT;
+    }
+
+    protected function handleTripPayment($mpPayment)
+    {
+        // parse tripId from external reference
+        $externalReference = $mpPayment['external_reference'];
+        $decodedReference = $this->parseExternalReference($externalReference);
+
+        if (! $decodedReference) {
+            Log::error('Failed to parse trip payment external reference', ['external_reference' => $externalReference]);
+
+            return response()->json(['error' => 'Invalid external reference'], 400);
+        }
+
+        $tripId = explode('Sellado de Viaje ID: ', $decodedReference)[1];
+
+        // get the trip for this payment
+        $trip = Trip::where('id', $tripId)->first();
+        if (! $trip) {
+            Log::error('Trip not found', [
+                'payment_id' => $mpPayment['id'],
+                'external_reference' => $externalReference,
+                'trip_id' => $tripId,
+            ]);
+
+            return response()->json(['error' => 'Trip not found'], 404);
+        }
+
+        // create the payment attempt in the database
+        $paymentAttempt = new PaymentAttempt;
+        $paymentAttempt->payment_id = $mpPayment['id'];
+        $paymentAttempt->payment_status = $this->mapMercadoPagoStatusToPaymentAttemptStatus($mpPayment['status']);
+        $paymentAttempt->payment_data = $mpPayment;
+        $paymentAttempt->trip_id = $trip->id;
+        $paymentAttempt->user_id = $trip->user_id;
+        $paymentAttempt->save();
+
+        // Update payment status
+        $newStatus = $this->updatePaymentStatus($paymentAttempt, $mpPayment);
+
+        // Update trip status based on payment status
+        $this->updateTripStatus($trip, $newStatus);
+
+        return response()->json(['status' => 'success']);
+    }
+
+    protected function handleCampaignDonation($mpPayment)
+    {
+        // Parse campaign ID, reward ID, user ID and donation ID from external reference
+        $externalReference = $mpPayment['external_reference'];
+        $decodedReference = $this->parseExternalReference($externalReference);
+
+        if (! $decodedReference) {
+            Log::error('Failed to parse campaign donation external reference', ['external_reference' => $externalReference]);
+
+            return response()->json(['error' => 'Invalid external reference'], 400);
+        }
+
+        // Parse the decoded reference
+        preg_match('/Donación Campaña ID: (\d+); Slug: ([^;]+); Reward ID: (\d+); User ID: ([^;]+); Donation ID: (\d+)/', $decodedReference, $matches);
+
+        if (count($matches) !== 6) {
+            Log::error('Invalid campaign donation external reference format', ['external_reference' => $externalReference, 'decoded_reference' => $decodedReference]);
+
+            return response()->json(['error' => 'Invalid external reference format'], 400);
+        }
+
+        $campaignId = intval($matches[1]);
+        $rewardId = intval($matches[3]);
+        $userId = $matches[4] === 'Anonymous' ? null : intval($matches[4]);
+        $donationId = intval($matches[5]);
+
+        // Find the existing donation
+        $donation = CampaignDonation::find($donationId);
+        if (! $donation) {
+            Log::error('Campaign donation not found', [
+                'payment_id' => $mpPayment['id'],
+                'donation_id' => $donationId,
+                'external_reference' => $externalReference,
+            ]);
+
+            return response()->json(['error' => 'Campaign donation not found'], 404);
+        }
+
+        // Verify the donation belongs to the correct campaign and reward
+        if ($donation->campaign_id !== $campaignId || $donation->campaign_reward_id !== $rewardId) {
+            Log::error('Campaign donation does not match external reference', [
+                'payment_id' => $mpPayment['id'],
+                'donation_id' => $donationId,
+                'donation_campaign_id' => $donation->campaign_id,
+                'donation_reward_id' => $donation->campaign_reward_id,
+                'expected_campaign_id' => $campaignId,
+                'expected_reward_id' => $rewardId,
+            ]);
+
+            return response()->json(['error' => 'Campaign donation mismatch'], 400);
+        }
+
+        // Update the donation status based on payment status
+        $newStatus = $this->mapMercadoPagoStatusToDonationStatus($mpPayment['status']);
+        $donation->status = $newStatus;
+
+        // Update payment_id with the actual payment ID
+        $donation->payment_id = $mpPayment['id'];
+
+        $donation->save();
+
+        return response()->json(['status' => 'success']);
+    }
+
+    /**
+     * Handle order.processed webhook from QR/Orders API.
+     * Payload structure differs from payment.created - order data is in request body.
+     */
+    protected function handleOrderProcessed(Request $request)
+    {
+        if (! $this->verifyMercadoPagoRequest($request, true)) {
+            Log::error('Invalid MercadoPago order webhook request');
+
+            return response()->json(['error' => 'Invalid request'], 400);
+        }
+
+        $orderData = $request->input('data');
+        if (! is_array($orderData) || ! isset($orderData['external_reference'])) {
+            Log::error('Invalid order.processed webhook: missing data or external_reference');
+
+            return response()->json(['error' => 'Invalid payload'], 400);
+        }
+
+        $externalReference = $orderData['external_reference'] ?? '';
+        $orderStatus = $orderData['status'] ?? '';
+        $orderStatusDetail = $orderData['status_detail'] ?? '';
+        $payments = $this->extractOrderPayments($orderData);
+
+        // Only process when order is fully paid (processed + accredited)
+        if ($orderStatus !== 'processed' || $orderStatusDetail !== 'accredited') {
+            return response()->json(['status' => 'success']);
+        }
+
+        $paymentId = null;
+        if (! empty($payments) && isset($payments[0]['id'])) {
+            $paymentId = $payments[0]['id'];
+        }
+
+        return $this->routeAccreditedQrCompatiblePayment($externalReference, $paymentId, $orderStatusDetail);
+    }
+
+    /**
+     * @param  array<string, mixed>  $orderData
+     * @return array<int, array<string, mixed>>
+     */
+    protected function extractOrderPayments(array $orderData): array
+    {
+        $transactions = $orderData['transactions'] ?? null;
+        if (! is_array($transactions)) {
+            return [];
+        }
+
+        $payments = $transactions['payments'] ?? null;
+
+        return is_array($payments) ? $payments : [];
+    }
+
+    /**
+     * Handle topic_merchant_order_wh (legacy commercial order notifications).
+     * MP may send these for QR payments instead of order.processed depending on integration config.
+     * When status is closed, fetch the merchant order and mark manual validation as paid.
+     */
+    protected function handleMerchantOrderWebhook(Request $request)
+    {
+        $action = $request->input('action');
+        $status = $request->input('status') ?? ($request->input('data.status') ?? null);
+        $merchantOrderId = $request->query('data_id') ?? $request->input('data_id');
+
+        if ($action !== 'update' || $status !== 'closed') {
+            return response()->json(['status' => 'success']);
+        }
+
+        if (! $this->verifyMercadoPagoRequest($request, false)) {
+            Log::error('Invalid MercadoPago merchant order webhook request');
+
+            return response()->json(['error' => 'Invalid request'], 400);
+        }
+
+        if (! $merchantOrderId) {
+            return response()->json(['error' => 'No merchant order ID'], 400);
+        }
+
+        $merchantOrder = $this->getMercadoPagoMerchantOrder($merchantOrderId);
+        if (! $merchantOrder) {
+            return response()->json(['error' => 'Could not fetch merchant order'], 500);
+        }
+
+        $externalReference = $merchantOrder['external_reference'] ?? '';
+        $paymentId = null;
+        $payments = $merchantOrder['payments'] ?? [];
+        if (is_array($payments)) {
+            foreach ($payments as $payment) {
+                if (is_array($payment) && ($payment['status'] ?? '') === 'approved' && isset($payment['id'])) {
+                    $paymentId = $payment['id'];
+                    break;
+                }
+            }
+            if ($paymentId === null && isset($payments[0]['id'])) {
+                $paymentId = $payments[0]['id'];
+            }
+        }
+
+        return $this->routeAccreditedQrCompatiblePayment($externalReference, $paymentId, 'accredited');
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    protected function getMercadoPagoMerchantOrder($merchantOrderId): ?array
+    {
+        $tokens = array_values(array_filter(array_unique([
+            config('services.mercadopago.qr_payment_access_token'),
+            config('services.mercadopago.access_token'),
+        ])));
+
+        if ($tokens === []) {
+            Log::error('No Mercado Pago access token configured for merchant order fetch');
+
+            return null;
+        }
+
+        foreach ($tokens as $token) {
+            try {
+                $response = Http::timeout(15)
+                    ->withToken($token)
+                    ->get('https://api.mercadopago.com/merchant_orders/'.$merchantOrderId);
+
+                if ($response->successful()) {
+                    $body = $response->json();
+                    if (is_array($body)) {
+                        return $body;
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::error('Error fetching MercadoPago merchant order', [
+                    'merchant_order_id' => $merchantOrderId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Handle payment webhook for manual identity validation (Checkout Pro or QR).
+     * external_reference: manual_validation:requestId (Checkout Pro) or manual_validation_requestId (QR)
+     */
+    protected function handleManualValidationPayment($mpPayment)
+    {
+        $externalReference = $mpPayment['external_reference'] ?? '';
+        $prefix = strpos($externalReference, 'manual_validation:') === 0 ? 'manual_validation:' : 'manual_validation_';
+        $requestId = (int) substr($externalReference, strlen($prefix));
+        if ($requestId <= 0) {
+            Log::error('Invalid manual_validation external reference', ['external_reference' => $externalReference]);
+
+            return response()->json(['error' => 'Invalid external reference'], 400);
+        }
+
+        $validationRequest = ManualIdentityValidation::find($requestId);
+        if (! $validationRequest) {
+            Log::error('Manual identity validation request not found', [
+                'payment_id' => $mpPayment['id'],
+                'request_id' => $requestId,
+            ]);
+
+            return response()->json(['error' => 'Request not found'], 404);
+        }
+
+        $status = $mpPayment['status'] ?? '';
+        if ($status === 'approved') {
+            if (! $validationRequest->paid) {
+                $validationRequest->payment_id = (string) $mpPayment['id'];
+                $validationRequest->markPaidAndAwaitingPhotosIfNeeded();
+                $validationRequest->save();
+                app(IdentityVerificationOutcome::class)->emit([
+                    'user_id' => $validationRequest->user_id,
+                    'method' => IdentityVerificationOutcome::METHOD_MANUAL,
+                    'name' => IdentityVerificationOutcome::NAME_PAYMENT_SUCCEEDED,
+                    'related_type' => 'manual_identity_validations',
+                    'related_id' => $validationRequest->id,
+                    'metadata' => ['payment_channel' => 'webhook'],
+                ]);
+            }
+        } elseif (in_array($status, ['rejected', 'cancelled'], true)) {
+            app(IdentityVerificationOutcome::class)->emit([
+                'user_id' => $validationRequest->user_id,
+                'method' => IdentityVerificationOutcome::METHOD_MANUAL,
+                'name' => IdentityVerificationOutcome::NAME_PAYMENT_FAILED,
+                'related_type' => 'manual_identity_validations',
+                'related_id' => $validationRequest->id,
+                'metadata' => ['payment_status' => $status],
+            ]);
+        }
+
+        return response()->json(['status' => 'success']);
+    }
+
+    protected function mapMercadoPagoStatusToDonationStatus($mpStatus)
+    {
+        $statusMap = [
+            'approved' => 'paid',
+            'rejected' => 'failed',
+            'pending' => 'pending',
+            'in_process' => 'pending',
+            'cancelled' => 'failed',
+            'refunded' => 'failed',
+            'in_mediation' => 'pending',
+            'charged_back' => 'failed',
+        ];
+
+        return $statusMap[$mpStatus] ?? 'pending';
+    }
+
+    protected function handlePlatformDonationPayment(array $mpPayment)
+    {
+        try {
+            $this->platformDonationService->handlePlatformPayment($mpPayment);
+        } catch (\Throwable $e) {
+            Log::error('Failed to handle platform donation payment', [
+                'payment_id' => $mpPayment['id'] ?? null,
+                'message' => $e->getMessage(),
+            ]);
+
+            return response()->json(['error' => 'Failed to process platform donation'], 500);
+        }
+
+        return response()->json(['status' => 'success']);
+    }
+
+    protected function handleSubscriptionPreapprovalWebhook(Request $request)
+    {
+        if (! $this->verifyMercadoPagoRequest($request)) {
+            Log::error('Invalid MercadoPago subscription_preapproval webhook request');
+
+            return response()->json(['error' => 'Invalid request'], 400);
+        }
+
+        $preapprovalId = $this->webhookResourceId($request);
+        if (! $preapprovalId) {
+            return response()->json(['error' => 'No preapproval ID'], 400);
+        }
+
+        $preapproval = $this->mercadoPagoService->getPreapproval((string) $preapprovalId);
+        if (! $preapproval) {
+            return response()->json(['error' => 'Could not fetch preapproval'], 500);
+        }
+
+        $this->platformDonationService->handleSubscriptionPreapproval($preapproval);
+
+        return response()->json(['status' => 'success']);
+    }
+
+    protected function handleSubscriptionAuthorizedPaymentWebhook(Request $request)
+    {
+        if (! $this->verifyMercadoPagoRequest($request)) {
+            Log::error('Invalid MercadoPago subscription_authorized_payment webhook request');
+
+            return response()->json(['error' => 'Invalid request'], 400);
+        }
+
+        $invoiceId = $this->webhookResourceId($request);
+        if (! $invoiceId) {
+            return response()->json(['error' => 'No authorized payment ID'], 400);
+        }
+
+        $invoice = $this->mercadoPagoService->getAuthorizedPayment((string) $invoiceId);
+        if (! $invoice) {
+            return response()->json(['error' => 'Could not fetch authorized payment'], 500);
+        }
+
+        $chargePayload = $this->platformDonationService->mapAuthorizedPaymentInvoiceToChargePayload($invoice);
+        if ($chargePayload === null) {
+            Log::info('MercadoPago authorized payment without nested payment yet', [
+                'invoice_id' => $invoiceId,
+                'preapproval_id' => $invoice['preapproval_id'] ?? null,
+            ]);
+
+            ReconcileClubSubscriptionInvoiceJob::dispatch((string) $invoiceId);
+
+            return response()->json(['status' => 'success']);
+        }
+
+        $this->platformDonationService->handleSubscriptionAuthorizedPayment($chargePayload);
+
+        return response()->json(['status' => 'success']);
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    protected function resolveClubPreapprovalIdFromPayment(array $mpPayment): ?string
+    {
+        $preapprovalId = $mpPayment['preapproval_id'] ?? null;
+        if (! $preapprovalId && is_array($mpPayment['metadata'] ?? null)) {
+            $preapprovalId = $mpPayment['metadata']['preapproval_id'] ?? null;
+        }
+
+        return $preapprovalId ? (string) $preapprovalId : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    protected function looksLikeClubSubscriptionPayment(array $mpPayment): bool
+    {
+        $interactionType = $this->pointOfInteractionType($mpPayment);
+        if ($interactionType === 'SUBSCRIPTIONS') {
+            return true;
+        }
+
+        $description = $mpPayment['description'] ?? '';
+        if (is_string($description) && str_starts_with($description, 'Donación mensual Carpoolear')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    protected function pointOfInteractionType(array $mpPayment): ?string
+    {
+        $poi = $mpPayment['point_of_interaction'] ?? null;
+        if (! is_array($poi)) {
+            return null;
+        }
+
+        $type = $poi['type'] ?? null;
+
+        return is_string($type) ? $type : null;
+    }
+}

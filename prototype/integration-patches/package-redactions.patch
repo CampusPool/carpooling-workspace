@@ -1,0 +1,9 @@
+Package-only safety redaction applied after the pinned upstream export:
+
+* `public/js/scripts.js` no longer contains the upstream Instagram access token
+  and client id. The integration does not rely on that optional feed.
+* The empty generated `.env` file was omitted. Runtime values come only from
+  `config/.env.example` copied to a disposable Compose file.
+
+This is a packaging redaction, not an application feature change. It must be
+reviewed with the source provenance and license decision.

@@ -1,0 +1,20 @@
+services:
+  migrate:
+    environment:
+      APP_TIMEZONE: Asia/Kolkata
+      MOBILITY_EXTENSION_ROOT: /opt/mobility-extension
+    volumes:
+      - ../../../backend/extensions/carpoolear:/opt/mobility-extension:ro
+      - ../../../backend/extensions/carpoolear/Mobility:/var/www/app/Mobility:ro
+      - ../../../backend/integrations/carpoolear/MobilityIntegration:/var/www/app/MobilityIntegration:ro
+  app:
+    environment:
+      APP_TIMEZONE: Asia/Kolkata
+      MOBILITY_EXTENSION_ROOT: /opt/mobility-extension
+      MOBILITY_PILOT_UI_ENABLED: "true"
+    volumes:
+      - ../../../backend/extensions/carpoolear:/opt/mobility-extension:ro
+      - ../../../backend/extensions/carpoolear/Mobility:/var/www/app/Mobility:ro
+      - ../../../backend/integrations/carpoolear/MobilityIntegration:/var/www/app/MobilityIntegration:ro
+      - ../../../backend/extensions/carpoolear/tests:/var/www/tests/Feature/Mobility:ro
+      - ./lifecycle-probe.php:/opt/mobility/lifecycle-probe.php:ro

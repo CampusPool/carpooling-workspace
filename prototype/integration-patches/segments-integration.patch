@@ -1,0 +1,79 @@
+--- a/app/Repository/PassengersRepository.php
++++ b/app/Repository/PassengersRepository.php
+@@ -93,6 +93,9 @@
+ 
+     public function newRequest($tripId, $user, $data = [])
+     {
++        if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
++            return app(\STS\Mobility\Segments\SegmentBookingService::class)->newRequest((int) $tripId, $user, $data);
++        }
+         return DB::transaction(function () use ($tripId, $user) {
+             $trip = Trip::query()->lockForUpdate()->find($tripId);
+             if (! $trip || $this->userHasActiveRequest($tripId, $user->id)) {
+@@ -110,6 +113,9 @@
+ 
+     private function changeRequestState($tripId, $userId, $newState, $criterias, $canceledState = null)
+     {
++        if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
++            return app(\STS\Mobility\Segments\SegmentBookingService::class)->changeState((int) $tripId, (int) $userId, (int) $newState, $criterias, $canceledState === null ? null : (int) $canceledState);
++        }
+         $updateData = [
+             'request_state' => $newState,
+             'canceled_state' => $canceledState,
+@@ -188,6 +194,9 @@
+ 
+     public function acceptRequest($tripId, $acceptedUserId, $user, $data)
+     {
++        if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
++            return app(\STS\Mobility\Segments\SegmentBookingService::class)->acceptRequest((int) $tripId, (int) $acceptedUserId);
++        }
+         return DB::transaction(function () use ($tripId, $acceptedUserId) {
+             $trip = Trip::query()->lockForUpdate()->find($tripId);
+             if (! $trip || ! $this->isUserRequestPending($tripId, $acceptedUserId)) {
+--- a/app/Services/Logic/PassengersManager.php
++++ b/app/Services/Logic/PassengersManager.php
+@@ -240,7 +240,7 @@
+         $acceptedUser = $this->uRepo->show($acceptedUserId);
+         $trip = $this->tripLogic->show($user, $tripId);
+         if ($this->isUserRequestPending($tripId, $acceptedUserId) && $this->tripLogic->tripOwner($user, $trip)) {
+-            if ((int) $trip->seats_available === 0) {
++            if (! app(\STS\Mobility\Segments\SegmentBookingService::class)->hasCapacity($trip, (int) $acceptedUserId)) {
+                 $this->setErrors(['error' => 'not_seat_available']);
+ 
+                 return;
+--- a/app/Models/Trip.php
++++ b/app/Models/Trip.php
+@@ -290,7 +290,7 @@
+ 
+     public function getSeatsAvailableAttribute()
+     {
+-        return $this->total_seats - $this->passengerAccepted()->count();
++        return \STS\Mobility\Segments\SegmentInventory::available($this);
+     }
+ 
+     public function getIsDriverAttribute()
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -164,6 +164,7 @@
+ 
+     public function update($trip, array $data)
+     {
++        \STS\Mobility\Segments\PublishedTripGuard::input($trip, $data);
+         $descriptionBefore = (string) $trip->description;
+         $seatPriceCentsBefore = (int) $trip->seat_price_cents;
+         $maximumTripPriceCentsBefore = $trip->maximum_trip_price_cents;
+--- a/app/Listeners/Request/ModuleLimitedRequest.php
++++ b/app/Listeners/Request/ModuleLimitedRequest.php
+@@ -54,7 +54,11 @@
+                         $tripOwnerUser = User::find($tripRequest->user_id);
+                         event(new AutoCancelEvent($tripRequest, $tripOwnerUser, $acceptedUser));
+                     }
+-                    $request->save();
++                    if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $request->trip_id)) {
++                        app(\STS\Mobility\Segments\SegmentBookingService::class)->changeState((int) $request->trip_id, (int) $request->user_id, Passenger::STATE_CANCELED, ['request_state' => Passenger::STATE_PENDING], Passenger::CANCELED_SYSTEM);
++                    } else {
++                        $request->save();
++                    }
+                 }
+             }
+         }

@@ -1,0 +1,22 @@
+--- a/app/Repository/PassengersRepository.php
++++ b/app/Repository/PassengersRepository.php
+@@ -97,6 +97,9 @@
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->newRequest((int) $tripId, $user, $data);
+         }
++        if (\STS\Mobility\Trust\CohortPolicy::required()) {
++            throw new \STS\Mobility\Segments\SegmentException('TRUSTED_ROUTE_QUOTE_REQUIRED');
++        }
+         return DB::transaction(function () use ($tripId, $user) {
+             $trip = Trip::query()->lockForUpdate()->find($tripId);
+             if (! $trip || $this->userHasActiveRequest($tripId, $user->id)) {
+@@ -200,6 +203,9 @@
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->acceptRequest((int) $tripId, (int) $acceptedUserId);
+         }
++        if (\STS\Mobility\Trust\CohortPolicy::required()) {
++            throw new \STS\Mobility\Segments\SegmentException('TRUSTED_ROUTE_QUOTE_REQUIRED');
++        }
+         return DB::transaction(function () use ($tripId, $acceptedUserId) {
+             $trip = Trip::query()->lockForUpdate()->find($tripId);
+             if (! $trip || ! $this->isUserRequestPending($tripId, $acceptedUserId)) {

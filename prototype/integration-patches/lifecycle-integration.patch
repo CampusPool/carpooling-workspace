@@ -1,0 +1,105 @@
+diff --git a/app/Repository/TripRepository.php b/app/Repository/TripRepository.php
+index e93d741..bdf304f 100755
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -476,6 +476,13 @@ public function search($user, $data)
+     {
+ 
+         $trips = Trip::query()->with(['routes']);
++        if (! filter_var($data['history'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
++            $trips->whereNotExists(function ($query) {
++                $query->selectRaw('1')->from('mobility_trip_lifecycles')
++                    ->whereColumn('mobility_trip_lifecycles.trip_id', 'trips.id')
++                    ->where('mobility_trip_lifecycles.state', '!=', 'planned');
++            });
++        }
+         if (isset($data['is_passenger'])) {
+             $trips->where('is_passenger', parse_boolean($data['is_passenger']));
+         }
+diff --git a/app/Services/Logic/TripLiveShareManager.php b/app/Services/Logic/TripLiveShareManager.php
+index f0d8262..458af38 100644
+--- a/app/Services/Logic/TripLiveShareManager.php
++++ b/app/Services/Logic/TripLiveShareManager.php
+@@ -98,7 +98,7 @@ public function getStatus(User $user, int $tripId): ?TripLiveShare
+     public function getPublicView(string $token): ?array
+     {
+         $share = $this->liveShareRepo->findByToken($token);
+-        if (! $share) {
++        if (! $share || ! $share->is_active) {
+             return null;
+         }
+ 
+diff --git a/bootstrap/app.php b/bootstrap/app.php
+index 666127b..5b4ea31 100644
+--- a/bootstrap/app.php
++++ b/bootstrap/app.php
+@@ -48,4 +48,5 @@
+     })
+     ->withProviders([
+         \STS\Providers\HealthServiceProvider::class,
++        \STS\Mobility\MobilityServiceProvider::class,
+     ])->create();
+diff --git a/routes/api.php b/routes/api.php
+index 0d79a51..18d6ae3 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -183,7 +183,7 @@
+     // Public live location view (unguessable token)
+     Route::get('live/{token}', [TripLiveShareController::class, 'publicView'])->middleware('logged.optional');
+ 
+-    Route::prefix('trips')->group(function () {
++    Route::prefix('trips')->middleware(\STS\MobilityIntegration\LegacyLifecycleGuard::class)->group(function () {
+         Route::get('/requests', [PassengerController::class, 'allRequests']);
+ 
+         Route::get('/transactions', [PassengerController::class, 'transactions']);
+diff --git a/tests/Feature/Http/TripLiveShareControllerIntegrationTest.php b/tests/Feature/Http/TripLiveShareControllerIntegrationTest.php
+index 4c4fac7..6746398 100644
+--- a/tests/Feature/Http/TripLiveShareControllerIntegrationTest.php
++++ b/tests/Feature/Http/TripLiveShareControllerIntegrationTest.php
+@@ -153,7 +153,7 @@ public function test_public_live_endpoint_returns_waiting_state_without_coordina
+             ->assertJsonPath('data.driver.name', 'Driver Name');
+     }
+ 
+-    public function test_public_live_endpoint_returns_stopped_state_for_inactive_share(): void
++    public function test_public_live_endpoint_revokes_inactive_share(): void
+     {
+         $driver = User::factory()->create(['name' => 'Driver Name']);
+         $trip = Trip::factory()->create(['user_id' => $driver->id, 'to_town' => 'Rosario']);
+@@ -168,10 +168,7 @@ public function test_public_live_endpoint_returns_stopped_state_for_inactive_sha
+ 
+         $response = $this->getJson("/api/live/{$share->share_token}");
+ 
+-        $response->assertOk()
+-            ->assertJsonPath('data.is_active', false)
+-            ->assertJsonPath('data.lat', null)
+-            ->assertJsonPath('data.driver.name', 'Driver Name');
++        $response->assertNotFound()->assertJsonMissingPath('data.driver')->assertJsonMissingPath('data.lat');
+     }
+ 
+     public function test_public_live_endpoint_returns_passenger_share_trip_context(): void
+diff --git a/tests/Unit/Services/Logic/TripLiveShareManagerTest.php b/tests/Unit/Services/Logic/TripLiveShareManagerTest.php
+index 52fe0c1..cb1519b 100644
+--- a/tests/Unit/Services/Logic/TripLiveShareManagerTest.php
++++ b/tests/Unit/Services/Logic/TripLiveShareManagerTest.php
+@@ -227,7 +227,7 @@ public function test_get_public_view_returns_waiting_state_without_coordinates()
+         $this->assertSame('Juan Driver', $view['driver']['name']);
+     }
+ 
+-    public function test_get_public_view_returns_stopped_state_for_inactive_share(): void
++    public function test_get_public_view_revokes_inactive_share(): void
+     {
+         $driver = User::factory()->create(['name' => 'Juan Driver']);
+         $trip = $this->ongoingTripFor($driver);
+@@ -242,11 +242,7 @@ public function test_get_public_view_returns_stopped_state_for_inactive_share():
+ 
+         $view = $this->manager()->getPublicView($share->share_token);
+ 
+-        $this->assertNotNull($view);
+-        $this->assertFalse($view['is_active']);
+-        $this->assertNull($view['lat']);
+-        $this->assertNull($view['lng']);
+-        $this->assertSame('Juan Driver', $view['driver']['name']);
++        $this->assertNull($view);
+     }
+ 
+     public function test_get_public_view_includes_trip_context_for_passenger_share(): void

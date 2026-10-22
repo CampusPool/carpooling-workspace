@@ -1,0 +1,52 @@
+<?php
+
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use STS\Http\Middleware\AuthOptional;
+use STS\Http\Middleware\UserLoggin;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+        api: __DIR__.'/../routes/api.php',
+        commands: __DIR__.'/../routes/console.php',
+        health: '/up',
+        then: function () {
+            require __DIR__.'/../routes/rate_limits.php';
+        },
+    )
+    ->withMiddleware(function (Middleware $middleware) {
+        $middleware->redirectGuestsTo('/pulse/login');
+
+        $middleware->alias([
+            'update.connection' => \STS\Http\Middleware\UpdateConnection::class,
+            'check.userbanned' => \STS\Http\Middleware\CheckUserBanned::class,
+            'throttle' => \Illuminate\Routing\Middleware\ThrottleRequests::class,
+            'user.admin' => \STS\Http\Middleware\UserAdmin::class,
+        ]);
+
+        $middleware->group('logged', [
+            UserLoggin::class,
+            \STS\Http\Middleware\UpdateConnection::class,
+            \STS\Http\Middleware\CheckUserBanned::class,
+        ]);
+
+        $middleware->group('logged.optional', [
+            AuthOptional::class,
+            \STS\Http\Middleware\UpdateConnection::class,
+            \STS\Http\Middleware\CheckUserBanned::class,
+        ]);
+
+        $middleware->appendToGroup('api', [
+            \STS\Http\Middleware\CheckMaintenanceMode::class,
+            \STS\Http\Middleware\BlockImpersonationDestructiveActions::class,
+        ]);
+    })
+    ->withExceptions(function (Exceptions $exceptions) {
+        //
+    })
+    ->withProviders([
+        \STS\Providers\HealthServiceProvider::class,
+        \STS\Mobility\MobilityServiceProvider::class,
+    ])->create();

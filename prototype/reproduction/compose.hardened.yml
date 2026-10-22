@@ -1,0 +1,14 @@
+services:
+  migrate:
+    volumes:
+      - ../../vendor/carpoolear_hardened:/var/www
+      - ../../vendor/carpoolear_backend/vendor:/var/www/vendor:ro
+  app:
+    tmpfs:
+      - /var/www/vendor/pestphp/pest/.temp
+    volumes:
+      - ../../vendor/carpoolear_hardened:/var/www
+      - ../../vendor/carpoolear_backend/vendor:/var/www/vendor:ro
+    environment:
+      MOBILITY_CARPOOLEAR_VARIANT: hardened
+      MOBILITY_PATCH_DIGEST: ${MOBILITY_PATCH_DIGEST:?Set the applied patch SHA256}

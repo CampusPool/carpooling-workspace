@@ -1,0 +1,366 @@
+<?php
+
+namespace STS\Services;
+
+use Google\Client;
+use GuzzleHttp\Client as HttpClient;
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Exception\RequestException;
+
+class FirebaseService
+{
+    /** @var mixed */
+    private $firebaseFile;
+
+    /** @var mixed */
+    private $firebaseName;
+
+    private Client $googleClient;
+
+    /**
+     * @param  Client|null  $googleClient  Optional Google client (tests); default constructs a real {@see Client}.
+     */
+    public function __construct(?Client $googleClient = null)
+    {
+        $this->firebaseFile = config('firebase.firebase_path');
+        $this->firebaseName = config('firebase.firebase_project_name');
+
+        // Inicializamos el cliente de Google con la cuenta de servicio
+        $this->googleClient = $googleClient ?? new Client;
+        $firebasePath = storage_path((string) $this->firebaseFile);
+
+        // In test/CI or local setups the env can point to a directory (or be empty).
+        // Avoid crashing on boot; send attempts will still fail downstream if misconfigured.
+        if ($this->firebaseFile && is_file($firebasePath) && is_readable($firebasePath)) {
+            $this->googleClient->setAuthConfig($firebasePath);
+        }
+        $this->googleClient->addScope('https://www.googleapis.com/auth/firebase.messaging');
+    }
+
+    /**
+     * Obtiene el token de acceso de Firebase.
+     */
+    public function getAccessToken()
+    {
+        $accessToken = $this->fetchMessagingAccessToken();
+
+        return $accessToken['access_token'];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function fetchMessagingAccessToken(): array
+    {
+        return $this->googleClient->fetchAccessTokenWithAssertion();
+    }
+
+    protected function httpClient(): HttpClient
+    {
+        return new HttpClient;
+    }
+
+    /**
+     * Envía una notificación usando FCM según el tipo de dispositivo.
+     */
+    public function sendNotification($deviceToken, $notification, $data, $deviceType = 'android')
+    {
+        try {
+            $accessToken = $this->getAccessToken();
+            $http = $this->httpClient();
+            $url = 'https://fcm.googleapis.com/v1/projects/'.$this->firebaseName.'/messages:send';
+
+            $message = [
+                'message' => [
+                    'token' => $deviceToken,
+                ],
+            ];
+
+            switch (strtolower($deviceType)) {
+                case 'android':
+                    $stringData = [];
+                    if (is_array($data)) {
+                        foreach ($data as $key => $value) {
+                            if (is_array($value) || is_object($value)) {
+                                $stringData[$key] = json_encode($value);
+                            } else {
+                                $stringData[$key] = (string) $value;
+                            }
+                        }
+                    }
+
+                    $message['message']['android'] = [
+                        'notification' => $notification,
+                        'data' => $stringData,
+                    ];
+                    break;
+
+                case 'ios':
+                    $stringData = [];
+                    if (is_array($data)) {
+                        foreach ($data as $key => $value) {
+                            if (is_array($value) || is_object($value)) {
+                                $stringData[$key] = json_encode($value);
+                            } else {
+                                $stringData[$key] = (string) $value;
+                            }
+                        }
+                    }
+
+                    $message['message']['apns'] = [
+                        'payload' => [
+                            'aps' => [
+                                'alert' => [
+                                    'title' => $notification['title'],
+                                    'body' => $notification['body'],
+                                ],
+                                'sound' => 'default',
+                                'badge' => 1,
+                            ],
+                        ],
+                        'headers' => [
+                            'apns-priority' => '10',
+                        ],
+                    ];
+                    $message['message']['data'] = $stringData;
+                    break;
+
+                case 'browser':
+                case 'web':
+                default:
+                    $stringData = [];
+                    if (is_array($data)) {
+                        foreach ($data as $key => $value) {
+                            if (is_array($value) || is_object($value)) {
+                                $stringData[$key] = json_encode($value);
+                            } else {
+                                $stringData[$key] = (string) $value;
+                            }
+                        }
+                    }
+
+                    $message['message']['webpush'] = [
+                        'notification' => $notification,
+                        'data' => $stringData,
+                    ];
+                    break;
+            }
+
+            $response = $http->post($url, [
+                'headers' => [
+                    'Authorization' => 'Bearer '.$accessToken,
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => $message,
+            ]);
+
+            $responseBody = json_decode($response->getBody(), true);
+            $statusCode = $response->getStatusCode();
+
+            return $responseBody;
+
+        } catch (ClientException $e) {
+            // Extract detailed error information from FCM API response
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : null;
+            $responseBody = null;
+            $errorDetails = null;
+
+            if ($e->getResponse()) {
+                try {
+                    $responseBody = json_decode($e->getResponse()->getBody()->getContents(), true);
+                    if (isset($responseBody['error'])) {
+                        $errorDetails = $responseBody['error'];
+                    }
+                } catch (\Exception $parseException) {
+                    $responseBody = $e->getResponse()->getBody()->getContents();
+                }
+            }
+
+            if (! self::isStaleRegistrationTokenError($e)) {
+                \Log::error('FirebaseService: FCM ClientException (HTTP '.$statusCode.')', [
+                    'device_token' => $deviceToken,
+                    'device_type' => $deviceType,
+                    'status_code' => $statusCode,
+                    'url' => $url,
+                    'project_name' => $this->firebaseName,
+                    'error_message' => $e->getMessage(),
+                    'fcm_error_code' => $errorDetails['code'] ?? null,
+                    'fcm_error_message' => $errorDetails['message'] ?? null,
+                    'fcm_error_status' => $errorDetails['status'] ?? null,
+                    'fcm_error_details' => $errorDetails['details'] ?? null,
+                    'full_error_response' => $responseBody,
+                    'request_payload' => $message,
+                    'error_trace' => $e->getTraceAsString(),
+                ]);
+            }
+
+            throw $e;
+        } catch (RequestException $e) {
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : null;
+            $responseBody = null;
+
+            if ($e->getResponse()) {
+                try {
+                    $responseBody = json_decode($e->getResponse()->getBody()->getContents(), true);
+                } catch (\Exception $parseException) {
+                    $responseBody = $e->getResponse()->getBody()->getContents();
+                }
+            }
+
+            \Log::error('FirebaseService: FCM RequestException', [
+                'device_token' => $deviceToken,
+                'device_type' => $deviceType,
+                'status_code' => $statusCode,
+                'url' => $url,
+                'project_name' => $this->firebaseName,
+                'error_message' => $e->getMessage(),
+                'full_error_response' => $responseBody,
+                'request_payload' => $message,
+                'error_trace' => $e->getTraceAsString(),
+            ]);
+
+            throw $e;
+        } catch (\Exception $e) {
+            \Log::error('FirebaseService: Error sending notification', [
+                'device_token' => $deviceToken,
+                'device_type' => $deviceType,
+                'url' => $url,
+                'project_name' => $this->firebaseName,
+                'error' => $e->getMessage(),
+                'error_trace' => $e->getTraceAsString(),
+                'notification' => $notification ?? null,
+                'data' => $data ?? null,
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Whether an FCM HTTP v1 error indicates the device registration token cannot be used
+     * with the configured Firebase project (stale, invalid, or wrong sender).
+     */
+    public static function isStaleRegistrationTokenError(\Throwable $e): bool
+    {
+        if (! $e instanceof ClientException || ! $e->getResponse()) {
+            return false;
+        }
+
+        try {
+            $stream = $e->getResponse()->getBody();
+            if ($stream->isSeekable()) {
+                $stream->rewind();
+            }
+            $body = json_decode($stream->getContents(), true);
+        } catch (\Exception) {
+            return false;
+        }
+
+        if (! is_array($body) || ! isset($body['error']) || ! is_array($body['error'])) {
+            return false;
+        }
+
+        $error = $body['error'];
+        $status = strtoupper((string) ($error['status'] ?? ''));
+        $message = (string) ($error['message'] ?? '');
+
+        return self::fcmTopLevelStatusIndicatesUnregistered($status, $message)
+            || self::fcmErrorDetailsIndicateUnregistered($error['details'] ?? null)
+            || self::fcmErrorMessageIndicatesUnusableToken($message);
+    }
+
+    private static function fcmTopLevelStatusIndicatesUnregistered(string $status, string $message): bool
+    {
+        if ($status === 'UNREGISTERED') {
+            return true;
+        }
+
+        return $status === 'NOT_FOUND' && strcasecmp($message, 'NotRegistered') === 0;
+    }
+
+    /**
+     * @param  mixed  $details
+     */
+    private static function fcmErrorDetailsIndicateUnregistered($details): bool
+    {
+        if (! is_array($details)) {
+            return false;
+        }
+
+        foreach ($details as $detail) {
+            if (! is_array($detail)) {
+                continue;
+            }
+
+            if (strtoupper((string) ($detail['errorCode'] ?? '')) === 'UNREGISTERED') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function fcmErrorMessageIndicatesUnusableToken(string $message): bool
+    {
+        foreach ([
+            'not a valid fcm registration token',
+            'InvalidRegistration',
+            'SenderId mismatch',
+        ] as $needle) {
+            if (stripos($message, $needle) !== false) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Unregisters a device from FCM by sending a delete request
+     * This stops the device from receiving any future notifications
+     */
+    public function unregisterDevice($deviceToken)
+    {
+        return true;
+    }
+
+    /**
+     * Invalidates a FCM token by sending an invalid message
+     * This causes FCM to mark the token as invalid
+     */
+    private function invalidateToken($deviceToken)
+    {
+        try {
+            $accessToken = $this->getAccessToken();
+
+            $http = $this->httpClient();
+            $url = 'https://fcm.googleapis.com/v1/projects/'.$this->firebaseName.'/messages:send';
+
+            $message = [
+                'message' => [
+                    'token' => $deviceToken,
+                    'webpush' => [
+                        'notification' => [
+                            'title' => '',
+                            'body' => '',
+                        ],
+                    ],
+                    'data' => [
+                        'invalidate' => 'true',
+                    ],
+                ],
+            ];
+
+            $http->post($url, [
+                'headers' => [
+                    'Authorization' => 'Bearer '.$accessToken,
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => $message,
+            ]);
+
+            return true;
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+}

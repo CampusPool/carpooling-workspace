@@ -1,0 +1,104 @@
+<?php
+
+namespace STS\Services\Admin;
+
+use Illuminate\Pagination\LengthAwarePaginator;
+use STS\Models\SupportTicket;
+use STS\Models\Trip;
+use STS\Services\ContributionCheck\TripMaximumSeatPrice;
+use STS\Support\TripExcessContributionSort;
+
+class TripExcessContributionListService
+{
+    public function paginate(
+        int $perPage,
+        int $page,
+        bool $requiresActionOnly = false,
+        ?string $sort = null,
+        ?string $direction = null,
+    ): LengthAwarePaginator {
+        $query = Trip::query()
+            ->with(['user:id,name,private_note'])
+            ->where('has_potential_excess_contribution', true);
+
+        if ($requiresActionOnly) {
+            $query = TripExcessContributionSort::applyRequiresActionOnlyFilter($query);
+        }
+
+        $query = TripExcessContributionSort::apply($query, $sort, $direction);
+
+        $paginator = $query->paginate($perPage, ['*'], 'page', $page);
+
+        $pageItems = collect($paginator->items());
+        $ticketCounts = SupportTicket::countsOpenExcessContributionByUserIds(
+            $pageItems->pluck('user_id')->all()
+        );
+
+        $items = $pageItems
+            ->map(fn (Trip $trip) => $this->serializeRow(
+                $trip,
+                $ticketCounts[(int) $trip->user_id] ?? 0
+            ))
+            ->values()
+            ->all();
+
+        return new LengthAwarePaginator(
+            $items,
+            $paginator->total(),
+            $paginator->perPage(),
+            $paginator->currentPage(),
+            ['path' => request()->url()]
+        );
+    }
+
+    public function findForAdmin(int $tripId): ?Trip
+    {
+        return Trip::query()
+            ->with(['user:id,name,email,private_note'])
+            ->where('has_potential_excess_contribution', true)
+            ->whereKey($tripId)
+            ->first();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function serializeDetail(Trip $trip): array
+    {
+        $ticketCount = SupportTicket::countsOpenExcessContributionByUserIds([(int) $trip->user_id])[(int) $trip->user_id] ?? 0;
+
+        return array_merge($this->serializeRow($trip, $ticketCount), [
+            'description' => $trip->description,
+            'trip_date' => $trip->trip_date?->toDateTimeString(),
+            'user_email' => $trip->user?->email,
+            'excess_contribution_ticket_id' => SupportTicket::excessContributionTicketIdForTrip((int) $trip->id),
+            'maximum_trip_price_cents' => $trip->maximum_trip_price_cents,
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function serializeRow(Trip $trip, int $excessContributionSupportTicketsCount = 0): array
+    {
+        $seatPriceCents = (int) $trip->seat_price_cents;
+
+        return [
+            'id' => $trip->id,
+            'from_town' => $trip->from_town,
+            'to_town' => $trip->to_town,
+            'seat_price_cents' => $seatPriceCents,
+            'maximum_seat_price_cents' => TripMaximumSeatPrice::centsFor($trip),
+            'potential_seat_price_cents' => $trip->description_potential_seat_price_cents,
+            'average_contribution_cents' => $trip->average_contribution_cents,
+            'excess_contribution_percentage' => $trip->excess_contribution_percentage,
+            'suspected_contribution' => $trip->suspected_contribution,
+            'phone_in_description' => (bool) $trip->phone_in_description,
+            'has_private_note' => trim((string) ($trip->user?->private_note ?? '')) !== '',
+            'user_id' => $trip->user_id,
+            'user_name' => $trip->user?->name,
+            'exceso_contribucion_status' => $trip->exceso_contribucion_status,
+            'excess_contribution_support_tickets_count' => $excessContributionSupportTicketsCount,
+        ];
+    }
+}

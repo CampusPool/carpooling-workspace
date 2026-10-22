@@ -1,0 +1,494 @@
+<?php
+
+namespace STS\Http\Controllers\Api\Admin;
+
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use STS\Http\Controllers\Concerns\StreamsSupportTicketAttachments;
+use STS\Http\Controllers\Controller;
+use STS\Models\AdminActionLog;
+use STS\Models\SupportTicket;
+use STS\Models\SupportTicketReply;
+use STS\Models\Trip;
+use STS\Notifications\SupportTicketReplyNotification;
+use STS\Services\AdminActionLogger;
+use STS\Services\SupportTicketService;
+use STS\Support\AdminPagination;
+use STS\Support\ImageAttachmentRules;
+use STS\Support\SupportTicketAdminListSort;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+
+class SupportTicketController extends Controller
+{
+    use StreamsSupportTicketAttachments;
+
+    private const ADMIN_CREATED_TICKET_STATUS = 'Esperando respuesta';
+
+    /**
+     * @return list<string>
+     */
+    private static function ticketDetailRelationships(): array
+    {
+        return [
+            'replies.attachments',
+            'replies.user:id,name',
+            'attachments',
+            'user',
+            'assignedTo:id,name',
+        ];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function ticketIndexRelationships(): array
+    {
+        return ['user:id,name', 'assignedTo:id,name'];
+    }
+
+    public function __construct(private readonly SupportTicketService $supportTicketService) {}
+
+    public function index(Request $request): JsonResponse
+    {
+        $this->supportTicketService->releaseExpiredAssignments();
+        $query = $this->buildAdminIndexQuery($request);
+        $perPage = AdminPagination::resolvePerPage($request->query('per_page'));
+        $page = AdminPagination::resolvePage($request->query('page'));
+
+        $query = SupportTicketAdminListSort::apply(
+            $query,
+            $request->query('sort'),
+            $request->query('direction')
+        );
+        $paginator = $query->paginate($perPage, ['*'], 'page', $page);
+        SupportTicketAdminListSort::decorateClubActive($paginator->items());
+
+        return response()->json([
+            'data' => $paginator->items(),
+            'meta' => [
+                'pagination' => AdminPagination::paginationMeta($paginator),
+            ],
+        ]);
+    }
+
+    /**
+     * @return \Illuminate\Database\Eloquent\Builder<SupportTicket>
+     */
+    private function buildAdminIndexQuery(Request $request)
+    {
+        $query = SupportTicket::query()
+            ->with(self::ticketIndexRelationships());
+
+        $type = $request->query('type');
+        if (is_string($type) && $type !== '' && in_array($type, SupportTicket::TYPES, true)) {
+            $query->where('type', $type);
+        }
+
+        $priority = $request->query('priority');
+        if (is_string($priority) && in_array($priority, ['low', 'normal', 'high'], true)) {
+            $query->where('priority', $priority);
+        }
+
+        if ($this->queryFlagIsTruthy($request->query('needs_reply'))) {
+            $query->adminNeedsAttention();
+        }
+
+        if ($this->queryFlagIsTruthy($request->query('open'))) {
+            $query->open();
+        }
+
+        if ($this->queryFlagIsTruthy($request->query('created_by_admin'))) {
+            $query->createdByAdmin();
+        }
+
+        $userId = $request->query('user_id');
+        if (is_numeric($userId) && (int) $userId > 0) {
+            $query->where('user_id', (int) $userId);
+        }
+
+        return $query;
+    }
+
+    public function show(int $id): JsonResponse
+    {
+        $this->supportTicketService->releaseExpiredAssignments();
+        $ticket = SupportTicket::with(self::ticketDetailRelationships())->findOrFail($id);
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function create(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'user_id' => 'required|integer|exists:users,id',
+            'type' => SupportTicket::typeValidationRule(),
+            'subject' => 'required|string|min:3|max:160',
+            'message_markdown' => 'required|string|min:1',
+            'trip_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('trips', 'id')->where('user_id', (int) $request->input('user_id')),
+            ],
+        ]);
+
+        $admin = auth()->user();
+        $tripId = isset($validated['trip_id']) ? (int) $validated['trip_id'] : null;
+        $existingTicketId = null;
+        $ticket = DB::transaction(function () use ($validated, $admin, $tripId, &$existingTicketId) {
+            if ($tripId !== null && $validated['type'] === 'excess_contribution') {
+                // Lock the trip row so concurrent requests cannot both create its excess ticket.
+                Trip::query()->whereKey($tripId)->lockForUpdate()->first();
+                $existingTicketId = SupportTicket::excessContributionTicketIdForTrip($tripId);
+                if ($existingTicketId !== null) {
+                    return null;
+                }
+            }
+
+            $ticket = SupportTicket::create([
+                'user_id' => (int) $validated['user_id'],
+                'trip_id' => $tripId,
+                'type' => $validated['type'],
+                'subject' => $validated['subject'],
+                'status' => self::ADMIN_CREATED_TICKET_STATUS,
+                'priority' => SupportTicket::TYPE_DEFAULT_PRIORITIES[$validated['type']] ?? 'normal',
+                'unread_for_user' => 1,
+                'unread_for_admin' => 0,
+                'created_by' => $admin->id,
+                'updated_by' => $admin->id,
+                'last_reply_at' => now(),
+            ]);
+
+            SupportTicketReply::create([
+                'ticket_id' => $ticket->id,
+                'user_id' => $admin->id,
+                'is_admin' => true,
+                'message_markdown' => $validated['message_markdown'],
+                'created_by' => $admin->id,
+            ]);
+
+            return $ticket->fresh();
+        });
+
+        if ($ticket === null) {
+            return response()->json([
+                'error' => 'This trip already has an excess contribution ticket.',
+                'existing_ticket_id' => $existingTicketId,
+            ], 409);
+        }
+
+        $this->logTicketMutation($admin, $ticket, 'create');
+
+        $notification = new SupportTicketReplyNotification;
+        $notification->setAttribute('ticket', $ticket);
+        $notification->setAttribute('from', $admin);
+        try {
+            $notification->notify($ticket->user);
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function reply(int $id, Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'message_markdown' => 'required|string|min:1',
+            'attachments' => 'nullable|array|max:3',
+            'attachments.*' => ImageAttachmentRules::FILE,
+        ]);
+
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+
+        if (! $this->supportTicketService->ticketAcceptsReplies($ticket)) {
+            return response()->json(['error' => 'Ticket is closed for replies'], 422);
+        }
+
+        if (! $this->supportTicketService->adminCanReplyToTicket($ticket, $admin)) {
+            return response()->json(['error' => 'Ticket is assigned to another admin'], 403);
+        }
+
+        if ($this->supportTicketService->ticketAlreadyHasReplyWithMessageMarkdown(
+            $ticket->id,
+            $validated['message_markdown'],
+        )) {
+            return response()->json(['error' => 'Duplicate reply'], 422);
+        }
+
+        DB::transaction(function () use ($validated, $admin, $ticket) {
+            $reply = SupportTicketReply::create([
+                'ticket_id' => $ticket->id,
+                'user_id' => $admin->id,
+                'is_admin' => true,
+                'message_markdown' => $validated['message_markdown'],
+                'created_by' => $admin->id,
+            ]);
+
+            foreach (($validated['attachments'] ?? []) as $file) {
+                $this->supportTicketService->storeReplyAttachments([$file], $ticket->id, $admin->id, $reply->id);
+            }
+
+            $this->supportTicketService->applyAdminReplyTransition($ticket, $admin->id);
+            $ticket->save();
+        });
+
+        $this->logTicketMutation($admin, $ticket, 'reply');
+
+        $notification = new SupportTicketReplyNotification;
+        $notification->setAttribute('ticket', $ticket->fresh());
+        $notification->setAttribute('from', $admin);
+        try {
+            $notification->notify($ticket->user);
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
+        return response()->json(['data' => $ticket->fresh()]);
+    }
+
+    public function resolve(int $id, Request $request): JsonResponse
+    {
+        return $this->applyActionStatus($id, $request, 'Resuelto');
+    }
+
+    public function close(int $id, Request $request): JsonResponse
+    {
+        return $this->applyActionStatus($id, $request, 'Cerrado');
+    }
+
+    public function reopen(int $id): JsonResponse
+    {
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+        $ticket->status = 'En revision';
+        $ticket->closed_at = null;
+        $ticket->closed_by = null;
+        $ticket->updated_by = $admin->id;
+        $ticket->save();
+
+        $this->logTicketMutation($admin, $ticket, 'reopen');
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function unresolve(int $id): JsonResponse
+    {
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+
+        if ($ticket->status !== 'Resuelto') {
+            return response()->json(['error' => 'Ticket is not resolved'], 422);
+        }
+
+        $this->supportTicketService->unresolveTicket($ticket, $admin->id);
+        $this->logTicketMutation($admin, $ticket, 'unresolve');
+
+        return response()->json(['data' => $ticket->fresh()]);
+    }
+
+    public function markNeedsReview(int $id, Request $request): JsonResponse
+    {
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+
+        if ($ticket->status === SupportTicket::STATUS_NEEDS_REVIEW) {
+            $this->supportTicketService->undoNeedsReviewTicket($ticket, $admin->id);
+            $this->logTicketMutation($admin, $ticket, 'undo_needs_review');
+
+            return response()->json(['data' => $ticket->fresh()]);
+        }
+
+        return $this->applyActionStatus($id, $request, SupportTicket::STATUS_NEEDS_REVIEW);
+    }
+
+    public function updateStatus(int $id, Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'status' => SupportTicket::statusValidationRule(),
+        ]);
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+        $ticket->status = $validated['status'];
+        $ticket->updated_by = $admin->id;
+        if ($validated['status'] === 'Cerrado') {
+            $ticket->closed_at = now();
+            $ticket->closed_by = $admin->id;
+        }
+        $ticket->save();
+
+        $this->logTicketMutation($admin, $ticket, 'status', ['status' => $validated['status']]);
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function updatePriority(int $id, Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'priority' => 'required|in:low,normal,high',
+        ]);
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+        $ticket->priority = $validated['priority'];
+        $ticket->updated_by = $admin->id;
+        $ticket->save();
+
+        $this->logTicketMutation($admin, $ticket, 'priority', ['priority' => $validated['priority']]);
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function updateType(int $id, Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'type' => SupportTicket::typeValidationRule(),
+        ]);
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+        $ticket->type = $validated['type'];
+        $ticket->priority = SupportTicket::TYPE_DEFAULT_PRIORITIES[$validated['type']] ?? 'normal';
+        $ticket->updated_by = $admin->id;
+        $ticket->save();
+
+        $this->logTicketMutation($admin, $ticket, 'type', ['type' => $validated['type']]);
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function updateInternalNote(int $id, Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'internal_note_markdown' => 'nullable|string',
+        ]);
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+        $ticket->internal_note_markdown = $validated['internal_note_markdown'] ?? null;
+        $ticket->updated_by = $admin->id;
+        $ticket->save();
+
+        $this->logTicketMutation($admin, $ticket, 'internal_note');
+
+        return response()->json(['data' => $ticket]);
+    }
+
+    public function attachmentImage(int $ticketId, int $attachmentId): StreamedResponse|JsonResponse
+    {
+        SupportTicket::query()->findOrFail($ticketId);
+
+        return $this->streamSupportTicketAttachment($this->supportTicketService, $ticketId, $attachmentId);
+    }
+
+    public function purgeAttachments(int $id): JsonResponse
+    {
+        $ticket = SupportTicket::query()->findOrFail($id);
+        $this->supportTicketService->purgeTicketAttachments($id);
+        $admin = auth()->user();
+        if ($admin) {
+            $this->logTicketMutation($admin, $ticket, 'purge_attachments');
+        }
+
+        return response()->json(['message' => 'Attachments purged']);
+    }
+
+    public function assignMe(int $id): JsonResponse
+    {
+        $this->supportTicketService->releaseExpiredAssignments();
+        $admin = auth()->user();
+        $ticket = SupportTicket::with(self::ticketDetailRelationships())->findOrFail($id);
+
+        try {
+            $this->supportTicketService->assignTicketToAdmin($ticket, $admin);
+        } catch (HttpException $exception) {
+            return response()->json(['error' => $exception->getMessage()], $exception->getStatusCode());
+        }
+
+        $this->logTicketMutation($admin, $ticket, 'assign_me');
+
+        return response()->json(['data' => $ticket->fresh(self::ticketDetailRelationships())]);
+    }
+
+    public function unassignMe(int $id): JsonResponse
+    {
+        $this->supportTicketService->releaseExpiredAssignments();
+        $admin = auth()->user();
+        $ticket = SupportTicket::with(self::ticketDetailRelationships())->findOrFail($id);
+
+        try {
+            $this->supportTicketService->unassignTicketFromAdmin($ticket, $admin);
+        } catch (HttpException $exception) {
+            return response()->json(['error' => $exception->getMessage()], $exception->getStatusCode());
+        }
+
+        $this->logTicketMutation($admin, $ticket, 'unassign_me');
+
+        return response()->json(['data' => $ticket->fresh(self::ticketDetailRelationships())]);
+    }
+
+    private function applyActionStatus(int $id, Request $request, string $status): JsonResponse
+    {
+        $validated = $request->validate([
+            'message_markdown' => 'nullable|string',
+        ]);
+        $admin = auth()->user();
+        $ticket = SupportTicket::findOrFail($id);
+
+        DB::transaction(function () use ($ticket, $admin, $status, $validated) {
+            if (! empty($validated['message_markdown'])) {
+                SupportTicketReply::create([
+                    'ticket_id' => $ticket->id,
+                    'user_id' => $admin->id,
+                    'is_admin' => true,
+                    'message_markdown' => $validated['message_markdown'],
+                    'created_by' => $admin->id,
+                ]);
+            }
+
+            $ticket->status = $status;
+            $ticket->updated_by = $admin->id;
+            if (in_array($status, ['Resuelto', 'Cerrado'], true)) {
+                $this->supportTicketService->clearTicketAssignment($ticket);
+            }
+            if ($status === 'Cerrado') {
+                $ticket->closed_by = $admin->id;
+                $ticket->closed_at = now();
+            }
+            $ticket->save();
+        });
+
+        $this->logTicketMutation($admin, $ticket, 'status', ['status' => $status]);
+
+        return response()->json(['data' => $ticket->fresh()]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $details
+     */
+    private function logTicketMutation($admin, SupportTicket $ticket, string $mutation, array $details = []): void
+    {
+        if (! $admin) {
+            return;
+        }
+
+        AdminActionLogger::log(
+            $admin,
+            AdminActionLog::ACTION_SUPPORT_TICKET_UPDATE,
+            (int) $ticket->user_id,
+            array_merge([
+                'ticket_id' => $ticket->id,
+                'mutation' => $mutation,
+            ], $details)
+        );
+    }
+
+    private function queryFlagIsTruthy(mixed $value): bool
+    {
+        if ($value === null || $value === '') {
+            return false;
+        }
+
+        return in_array(strtolower((string) $value), ['1', 'true', 'yes'], true);
+    }
+}

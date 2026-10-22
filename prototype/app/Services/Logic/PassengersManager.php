@@ -1,0 +1,355 @@
+<?php
+
+namespace STS\Services\Logic;
+
+use STS\Events\Passenger\Accept as AcceptEvent;
+use STS\Events\Passenger\AutoRequest as AutoRequestEvent;
+use STS\Events\Passenger\Cancel as CancelEvent;
+use STS\Events\Passenger\Reject as RejectEvent;
+use STS\Events\Passenger\Request as RequestEvent;
+use STS\Models\Passenger;
+use STS\Repository\PassengersRepository;
+use STS\Repository\UserRepository;
+use Validator;
+
+class PassengersManager extends BaseManager
+{
+    protected $passengerRepository;
+
+    protected $tripLogic;
+
+    protected $uRepo;
+
+    protected $conversationManager;
+
+    protected $userManager;
+
+    public function __construct(PassengersRepository $passengerRepository, TripsManager $tripLogic, UserRepository $uRepo, ConversationsManager $conversationManager, UsersManager $userManager)
+    {
+        $this->passengerRepository = $passengerRepository;
+        $this->tripLogic = $tripLogic;
+        $this->uRepo = $uRepo;
+        $this->conversationManager = $conversationManager;
+        $this->userManager = $userManager;
+    }
+
+    public function getPassengers($tripId, $user, $data)
+    {
+        if (! $this->tripLogic->tripOwner($user, $tripId) || $this->isUserRequestAccepted($tripId, $user->id)) {
+            $this->setErrors(['error' => 'access_denied']);
+
+            return;
+        }
+
+        return $this->passengerRepository->getPassengers($tripId, $user, $data);
+    }
+
+    public function getPendingRequests($tripId, $user, $data)
+    {
+        if ($tripId) {
+            if (! $this->tripLogic->tripOwner($user, $tripId)) {
+                $this->setErrors(['error' => 'access_denied']);
+
+                return;
+            }
+        }
+
+        return $this->passengerRepository->getPendingRequests($tripId, $user, $data);
+    }
+
+    public function getPendingPaymentRequests($tripId, $user, $data)
+    {
+        if ($tripId) {
+            if (! $this->tripLogic->tripOwner($user, $tripId)) {
+                $this->setErrors(['error' => 'access_denied']);
+
+                return;
+            }
+        }
+
+        return $this->passengerRepository->getPendingPaymentRequests($tripId, $user, $data);
+    }
+
+    public function getSeatRequests($user, $data)
+    {
+        return $this->passengerRepository->getSeatRequests($user, $data);
+    }
+
+    private function validateInput($input)
+    {
+        return Validator::make($input, [
+            'user_id' => 'required|numeric',
+            'trip_id' => 'required|numeric',
+        ]);
+    }
+
+    private function isInputValid($input)
+    {
+        $validation = $this->validateInput($input);
+
+        if ($validation->fails()) {
+            $this->setErrors($validation->errors());
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public function newRequest($tripId, $user, $data = [])
+    {
+        $userId = $user->id;
+
+        $input = [
+            'trip_id' => $tripId,
+            'user_id' => $userId,
+        ];
+
+        if (! $this->isInputValid($input)) {
+            return;
+        }
+        if ($this->passengerRepository->userHasActiveRequest($tripId, $userId)) {
+            return;
+        }
+
+        $trip = $this->tripLogic->show($user, $tripId);
+        if ($trip && ! $trip->expired()) {
+            $module_unaswered_message_limit = config('carpoolear.module_unaswered_message_limit', false);
+            if ($module_unaswered_message_limit) {
+                $allow = $this->userManager->unansweredConversationOrRequestsByTrip($trip);
+                if (! $allow) {
+                    $this->setErrors(['error' => 'user_has_reach_request_limit']);
+
+                    return;
+                }
+            }
+            // User Request Limited Module
+            if (config('carpoolear.module_user_request_limited_enabled', false)) {
+                $hours_range = (int) config('carpoolear.module_user_request_limited_hours_range', 2);
+                $userHasRequests = $user->tripsAsPassenger(null, $hours_range, $trip->trip_date)->count() > 0;
+                if ($userHasRequests) {
+                    $this->setErrors(['error' => 'user_has_another_similar_trip']);
+
+                    return;
+                }
+            }
+
+            if ($result = $this->passengerRepository->newRequest($tripId, $user, $data)) {
+                $friendsManager = app(FriendsManager::class);
+                $shouldAutoAccept = $trip->user->autoaccept_requests
+                    || ($trip->autoaccept_friends_requests && $friendsManager->areFriend($user, $trip->user));
+                if ($shouldAutoAccept) {
+                    // $result = $this->passengerRepository->acceptRequest($tripId, $user->id, $trip->user, $data);
+                    if (! config('carpoolear.module_trip_seats_payment', false)) {
+                        if ($result = $this->passengerRepository->acceptRequest($tripId, $user->id, $trip->user, $data)) {
+                            event(new AutoRequestEvent($trip, $user, $trip->user));
+                            event(new AcceptEvent($trip, $trip->user, $user));
+                        }
+                    } else {
+                        if ($result = $this->passengerRepository->aproveForPaymentRequest($tripId, $user->id, $trip->user, $data)) {
+                            event(new AutoRequestEvent($trip, $user, $trip->user));
+                            event(new AcceptEvent($trip, $trip->user, $user));
+                        }
+                    }
+                } else {
+                    event(new RequestEvent($trip, $user, $trip->user));
+                }
+            }
+
+            return $result;
+        } else {
+            $this->setErrors(['error' => 'access_denied']);
+
+            return;
+        }
+    }
+
+    public function cancelRequest($tripId, $cancelUserId, $user, $data = [])
+    {
+        $input = [
+            'trip_id' => $tripId,
+            'user_id' => $cancelUserId,
+        ];
+
+        if (! $this->isInputValid($input)) {
+            return;
+        }
+
+        $cancelUser = $this->uRepo->show($cancelUserId);
+        $trip = $this->tripLogic->show($user, $tripId);
+
+        $canceledState = null;
+
+        if ($this->isUserRequestPending($tripId, $cancelUserId) && (int) $cancelUserId === (int) $user->id) {
+            $canceledState = Passenger::CANCELED_REQUEST;
+        }
+
+        if ($this->isUserRequestAccepted($tripId, $cancelUserId) || $this->isUserRequestWaitingPayment($tripId, $cancelUserId)) {
+            if ((int) $cancelUserId === (int) $user->id) {
+                if ($this->isUserRequestWaitingPayment($tripId, $cancelUserId)) {
+                    $canceledState = Passenger::CANCELED_PASSENGER_WHILE_PAYING;
+                } else {
+                    $canceledState = Passenger::CANCELED_PASSENGER;
+                }
+            } else {
+                $canceledState = Passenger::CANCELED_DRIVER;
+            }
+        }
+
+        if ($canceledState !== null) {
+            if ($result = $this->passengerRepository->cancelRequest($tripId, $cancelUser, $canceledState)) {
+                if ((int) $trip->user_id === (int) $user->id) {
+                    event(new CancelEvent($trip, $trip->user, $cancelUser, $canceledState));
+                } else {
+                    event(new CancelEvent($trip, $cancelUser, $trip->user, $canceledState));
+                }
+            }
+
+            return $result;
+        } else {
+            $this->setErrors(['error' => 'not_a_passenger']);
+
+            return;
+        }
+    }
+
+    public function sendFullTripMessage($trip)
+    {
+        if (config('carpoolear.module_send_full_trip_message', false) && $trip->user->send_full_trip_message > 0) {
+            if (count($trip->passengerAccepted) >= $trip->seats_available) {
+                // tengo mas aceptados que asientos
+                // llamar al manager para que lo haga
+                $this->conversationManager->sendFullTripMessage($trip);
+            }
+        }
+    }
+
+    public function acceptRequest($tripId, $acceptedUserId, $user, $data = [])
+    {
+        $input = [
+            'trip_id' => $tripId,
+            'user_id' => $acceptedUserId,
+        ];
+
+        if (! $this->isInputValid($input)) {
+            return;
+        }
+
+        $acceptedUser = $this->uRepo->show($acceptedUserId);
+        $trip = $this->tripLogic->show($user, $tripId);
+        if ($this->isUserRequestPending($tripId, $acceptedUserId) && $this->tripLogic->tripOwner($user, $trip)) {
+            if ((int) $trip->seats_available === 0) {
+                $this->setErrors(['error' => 'not_seat_available']);
+
+                return;
+            }
+
+            if (! config('carpoolear.module_trip_seats_payment', false)) {
+                if ($result = $this->passengerRepository->acceptRequest($tripId, $acceptedUserId, $user, $data)) {
+                    $this->sendFullTripMessage($trip);
+                    event(new AcceptEvent($trip, $user, $acceptedUser));
+                }
+            } else {
+                if ($result = $this->passengerRepository->aproveForPaymentRequest($tripId, $acceptedUserId, $user, $data)) {
+                    event(new AcceptEvent($trip, $user, $acceptedUser));
+                }
+            }
+
+            return $result;
+        } else {
+            $this->setErrors(['error' => 'not_valid_request']);
+
+            return;
+        }
+    }
+
+    public function transactions($user)
+    {
+        $trips = $this->passengerRepository->tripsWithTransactions($user);
+        $transactions = [];
+
+        foreach ($trips as $trip) {
+            foreach ($trip->passenger as $pas) {
+                if (! empty($pas->payment_status)) {
+                    $pas->trip = $trip;
+                    array_push($transactions, $pas);
+                }
+            }
+        }
+
+        return $transactions;
+    }
+
+    public function payRequest($tripId, $payedUserId, $user, $data = [])
+    {
+        $input = [
+            'trip_id' => $tripId,
+            'user_id' => $payedUserId,
+        ];
+
+        if (! $this->isInputValid($input)) {
+            return;
+        }
+
+        $payedUser = $this->uRepo->show($payedUserId);
+        $trip = $this->tripLogic->show($user, $tripId);
+        if (! $this->isUserRequestWaitingPayment($tripId, $payedUserId)) {
+            $this->setErrors(['error' => 'not_valid_request']);
+
+            return;
+        }
+
+        if ($result = $this->passengerRepository->payRequest($tripId, $payedUserId, $user, $data)) {
+            $this->sendFullTripMessage($trip);
+            event(new RejectEvent($trip, $user, $payedUser));
+        }
+
+        return $result;
+    }
+
+    public function rejectRequest($tripId, $rejectedUserId, $user, $data = [])
+    {
+        $input = [
+            'trip_id' => $tripId,
+            'user_id' => $rejectedUserId,
+        ];
+
+        if (! $this->isInputValid($input)) {
+            return;
+        }
+
+        $rejectedUser = $this->uRepo->show($rejectedUserId);
+        $trip = $this->tripLogic->show($user, $tripId);
+        if (! $this->isUserRequestPending($tripId, $rejectedUserId) || ! $this->tripLogic->tripOwner($user, $trip)) {
+            $this->setErrors(['error' => 'not_valid_request']);
+
+            return;
+        }
+
+        if ($result = $this->passengerRepository->rejectRequest($tripId, $rejectedUserId, $user, $data)) {
+            event(new RejectEvent($trip, $user, $rejectedUser));
+        }
+
+        return $result;
+    }
+
+    public function isUserRequestWaitingPayment($tripId, $userId)
+    {
+        return $this->passengerRepository->isUserRequestWaitingPayment($tripId, $userId);
+    }
+
+    public function isUserRequestAccepted($tripId, $userId)
+    {
+        return $this->passengerRepository->isUserRequestAccepted($tripId, $userId);
+    }
+
+    public function isUserRequestRejected($tripId, $userId)
+    {
+        return $this->passengerRepository->isUserRequestRejected($tripId, $userId);
+    }
+
+    public function isUserRequestPending($tripId, $userId)
+    {
+        return $this->passengerRepository->isUserRequestPending($tripId, $userId);
+    }
+}

@@ -1,0 +1,66 @@
+--- a/app/Repository/PassengersRepository.php
++++ b/app/Repository/PassengersRepository.php
+@@ -93,6 +93,7 @@
+ 
+     public function newRequest($tripId, $user, $data = [])
+     {
++        \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->newRequest((int) $tripId, $user, $data);
+         }
+@@ -113,6 +114,7 @@
+ 
+     private function changeRequestState($tripId, $userId, $newState, $criterias, $canceledState = null)
+     {
++        \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->changeState((int) $tripId, (int) $userId, (int) $newState, $criterias, $canceledState === null ? null : (int) $canceledState);
+         }
+@@ -194,6 +196,7 @@
+ 
+     public function acceptRequest($tripId, $acceptedUserId, $user, $data)
+     {
++        \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->acceptRequest((int) $tripId, (int) $acceptedUserId);
+         }
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -371,6 +371,9 @@
+ 
+     public function show($user, $id)
+     {
++        if (! \STS\Mobility\Dispatch\DispatchBoundary::canView((int) $id, $user)) {
++            throw new \STS\Mobility\Dispatch\DispatchException('DISPATCH_TRIP_FORBIDDEN', 403);
++        }
+         if ($user->is_admin) {
+             $trip = Trip::with(['user', 'points', 'car', 'passenger', 'ratings'])->withTrashed()->whereId($id)->first();
+ 
+@@ -405,6 +408,9 @@
+     {
+         // Weekly schedule trips never expire, so include them regardless of trip_date
+         $trips = Trip::query();
++        if ((int) $user->id !== (int) $userId && ! $user->is_admin) {
++            \STS\Mobility\Dispatch\DispatchBoundary::scopePool($trips);
++        }
+         $this->filterActiveTrips($trips);
+ 
+         if ($asDriver) {
+@@ -424,6 +430,9 @@
+     {
+         // Weekly schedule trips never expire, so exclude them from old trips
+         $trips = Trip::where('trip_date', '<', Carbon::Now());
++        if ((int) $user->id !== (int) $userId && ! $user->is_admin) {
++            \STS\Mobility\Dispatch\DispatchBoundary::scopePool($trips);
++        }
+         $trips->where('weekly_schedule', '=', 0);
+ 
+         if ($asDriver) {
+@@ -483,6 +492,7 @@
+     {
+ 
+         $trips = Trip::query()->with(['routes']);
++        \STS\Mobility\Dispatch\DispatchBoundary::scopePool($trips);
+         if (! filter_var($data['history'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
+             $trips->whereNotExists(function ($query) {
+                 $query->selectRaw('1')->from('mobility_trip_lifecycles')

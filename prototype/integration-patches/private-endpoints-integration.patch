@@ -1,0 +1,13 @@
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -121,6 +121,10 @@
+         // obtener ruta o crear
+         $routeIds = [];
+         for ($i = 1; $i < count($points); $i++) {
++            // Private coordinates have no global node/route identity.
++            if (\STS\Mobility\Routing\TrustedRouteContext::privateEndpoints()) {
++                continue;
++            }
+             $origin = is_array($points[$i - 1]['json_address']) ? (object) $points[$i - 1]['json_address'] : json_decode($points[$i - 1]['json_address']);
+             $destiny = is_array($points[$i]['json_address']) ? (object) $points[$i]['json_address'] : json_decode($points[$i]['json_address']);
+             if (! isset($origin->id) || ! isset($destiny->id)) {

@@ -1,0 +1,73 @@
+services:
+  mysql:
+    image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+    environment:
+      MYSQL_DATABASE: carpoolear
+      MYSQL_USER: carpoolear
+      MYSQL_PASSWORD: smoke-db-password
+      MYSQL_ROOT_PASSWORD: smoke-root-password
+    volumes:
+      - campuspool_sprint1_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-psmoke-root-password"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [appnet]
+  deps:
+    build:
+      context: ..
+      dockerfile: reproduction/Dockerfile.smoke
+    working_dir: /var/www
+    volumes:
+      - ..:/var/www
+      - ./package.env:/var/www/.env:ro
+      - ../campuspool-extension:/opt/mobility-extension:ro
+      - ../campuspool-extension/Mobility:/var/www/app/Mobility:ro
+      - ../integration-patches/MobilityIntegration:/var/www/app/MobilityIntegration:ro
+    environment:
+      MOBILITY_EXTENSION_ROOT: /opt/mobility-extension
+    command: composer install --no-interaction --prefer-dist --no-progress
+  migrate:
+    build:
+      context: ..
+      dockerfile: reproduction/Dockerfile.smoke
+    working_dir: /var/www
+    volumes:
+      - ..:/var/www
+      - ./package.env:/var/www/.env:ro
+      - ../campuspool-extension:/opt/mobility-extension:ro
+      - ../campuspool-extension/Mobility:/var/www/app/Mobility:ro
+      - ../integration-patches/MobilityIntegration:/var/www/app/MobilityIntegration:ro
+    env_file: ./package.env
+    environment:
+      MOBILITY_EXTENSION_ROOT: /opt/mobility-extension
+    depends_on:
+      deps: {condition: service_completed_successfully}
+      mysql: {condition: service_healthy}
+    command: sh -c "php artisan migrate --force && php artisan db:seed --class=TestingSeeder --force"
+    networks: [appnet]
+  app:
+    build:
+      context: ..
+      dockerfile: reproduction/Dockerfile.smoke
+    working_dir: /var/www
+    volumes:
+      - ..:/var/www
+      - ./package.env:/var/www/.env:ro
+      - ../campuspool-extension:/opt/mobility-extension:ro
+      - ../campuspool-extension/Mobility:/var/www/app/Mobility:ro
+      - ../integration-patches/MobilityIntegration:/var/www/app/MobilityIntegration:ro
+    env_file: ./package.env
+    environment:
+      MOBILITY_EXTENSION_ROOT: /opt/mobility-extension
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    command: php artisan serve --host=0.0.0.0 --port=8000
+    networks: [appnet]
+volumes:
+  campuspool_sprint1_db:
+    name: ${COMPOSE_PROJECT_NAME}_db
+networks:
+  appnet:
+    internal: true

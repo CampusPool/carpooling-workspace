@@ -1,0 +1,76 @@
+<?php
+
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Schedule;
+use Symfony\Component\Console\Command\Command as SymfonyCommand;
+
+if (app()->runningUnitTests()) {
+    Artisan::command('test:test', function () {
+        return SymfonyCommand::SUCCESS;
+    });
+}
+
+Schedule::command('rate:create')->hourly();
+
+Schedule::command('trips:credit-finished')->everyFiveMinutes()->timezone('America/Argentina/Buenos_Aires')->withoutOverlapping(10);
+
+Schedule::command('trip:remainder')->hourly();
+
+Schedule::command('rating:availables')->everyMinute()->withoutOverlapping(5);
+
+Schedule::command('live-location:process')->everyMinute();
+
+Schedule::command('maintenance:tick')->everyMinute();
+
+Schedule::command('trip:request')->dailyAt('12:00')->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('trip:request')->dailyAt('19:00')->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('trip:visibilityclean')->dailyAt('03:00')->timezone('America/Argentina/Buenos_Aires');
+
+// $schedule->command('georoute:build')->everyMinute();
+
+Schedule::command('node:buildweights')->hourly();
+
+Schedule::command('messages:email')->everyTenMinutes();
+
+// TODO: add a job to check if trip is awaiting_payment after 30 minutes and send push/email?
+// Evaluate badges daily at 2 AM
+// Schedule::command('badges:evaluate')->dailyAt('02:00')->timezone('America/Argentina/Buenos_Aires');
+
+// Calculate active users per month on the 1st of each month at 3 AM
+Schedule::command('users:calculate-active-per-month')->monthlyOn(1, '03:00')->timezone('America/Argentina/Buenos_Aires');
+
+// Clean up expired password reset tokens daily at 4 AM
+Schedule::command('auth:cleanup-reset-tokens')->dailyAt('04:00')->timezone('America/Argentina/Buenos_Aires');
+
+// Auto-close resolved support tickets after configured inactivity days
+Schedule::command('support-tickets:autoclose')->dailyAt('04:30')->timezone('America/Argentina/Buenos_Aires');
+
+// Purge photos from rejected manual identity validations after retention period
+Schedule::command('manual-identity-validation:purge-rejected-photos')
+    ->dailyAt('05:00')
+    ->timezone('America/Argentina/Buenos_Aires');
+
+// Remind users who paid for manual validation but have not uploaded photos
+Schedule::command('manual-identity-validation:remind-upload-photos')
+    ->dailyAt('20:00')
+    ->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('support-tickets:release-expired-assignments')
+    ->everyMinute()
+    ->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('car-catalog:sync-argautos --mode=incremental')
+    ->weeklyOn(1, '03:00')
+    ->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('donations:sync-subscription-amounts')
+    ->everyTenMinutes()
+    ->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('donations:reconcile')
+    ->dailyAt('06:00')
+    ->timezone('America/Argentina/Buenos_Aires');
+
+Schedule::command('pulse:check --once')->everyMinute();

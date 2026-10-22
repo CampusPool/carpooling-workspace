@@ -1,0 +1,10 @@
+services:
+  app:
+    environment:
+      PHP_CLI_SERVER_WORKERS: "4"
+      TRIP_CREATION_LIMIT_MAX_TRIPS: "100"
+      TRIP_ROUTE_CACHE_BYPASS: "false"
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
+    volumes:
+      - ./journey-probe.php:/opt/mobility/journey-probe.php:ro
+      - ./raw:/opt/mobility/results

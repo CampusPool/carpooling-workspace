@@ -1,0 +1,522 @@
+<?php
+
+namespace STS\Http\Controllers\Api\v1;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
+use STS\Helpers\IdentityValidationHelper;
+use STS\Http\Controllers\Controller;
+use STS\Http\ExceptionWithErrors;
+use STS\Http\Resources\UserBadgeResource;
+use STS\Jobs\SendDeleteAccountRequestEmail;
+use STS\Models\AdminActionLog;
+use STS\Models\DeleteAccountRequest;
+use STS\Models\Donation;
+use STS\Models\Rating;
+use STS\Models\User;
+use STS\Services\AdminActionLogger;
+use STS\Services\AnonymizationService;
+use STS\Services\ClubCarpoolearMembershipService;
+use STS\Services\IdentityVerificationOutcome;
+use STS\Services\Logic\DeviceManager;
+use STS\Services\Logic\UsersManager;
+use STS\Services\MercadoPagoOAuthService;
+use STS\Services\UserDeletionService;
+use STS\Services\UserEditablePropertiesService;
+use STS\Transformers\ProfileTransformer;
+use Tymon\JWTAuth\Facades\JWTAuth;
+
+class UserController extends Controller
+{
+    protected $userLogic;
+
+    protected $deviceLogic;
+
+    protected $userDeletionService;
+
+    protected $anonymizationService;
+
+    protected UserEditablePropertiesService $userEditablePropertiesService;
+
+    public function __construct(
+        UsersManager $userLogic,
+        DeviceManager $deviceLogic,
+        UserDeletionService $userDeletionService,
+        AnonymizationService $anonymizationService,
+        UserEditablePropertiesService $userEditablePropertiesService
+    ) {
+        $this->middleware('logged')->except(['create', 'registerDonation', 'bankData', 'terms']);
+        $this->middleware('logged.optional')->only(['create', 'registerDonation', 'bankData', 'terms']);
+        $this->userLogic = $userLogic;
+        $this->deviceLogic = $deviceLogic;
+        $this->userDeletionService = $userDeletionService;
+        $this->anonymizationService = $anonymizationService;
+        $this->userEditablePropertiesService = $userEditablePropertiesService;
+    }
+
+    public function create(Request $request)
+    {
+        $data = $request->all();
+        if (config('carpoolear.module_validated_drivers', false)) {
+            $files = $request->file('driver_data_docs');
+            if (! empty($files)) {
+                $docs = [];
+                foreach ($files as $file) {
+                    if (! $file) {
+                        continue;
+                    }
+                    $tempDoc = $this->userLogic->uploadDoc($file);
+                    if ($tempDoc === false) {
+                        throw new ExceptionWithErrors('Invalid image upload.', $this->userLogic->getErrors());
+                    }
+                    $docs[] = $tempDoc;
+                }
+                $data['driver_data_docs'] = json_encode($docs);
+            }
+        }
+        $user = $this->userLogic->create($data);
+        if (! $user) {
+            throw new ExceptionWithErrors('Could not create new user.', $this->userLogic->getErrors());
+        }
+
+        return response()->json($this->registrationResponsePayload($user));
+    }
+
+    /**
+     * Fractal profile payload plus JWT when the new account may authenticate immediately.
+     */
+    private function registrationResponsePayload(User $user): array
+    {
+        $viewer = auth()->user() ?: $user;
+        $profileResponse = $this->item($user, new ProfileTransformer($viewer));
+        $payload = json_decode($profileResponse->getContent(), true);
+        if ($user->active && ! $user->banned) {
+            try {
+                $payload['token'] = JWTAuth::fromUser($user);
+            } catch (\Tymon\JWTAuth\Exceptions\JWTException $e) {
+                \Log::error('Could not issue JWT after registration: '.$e->getMessage());
+            }
+        }
+
+        return $payload;
+    }
+
+    public function update(Request $request)
+    {
+        $me = auth()->user();
+        $data = $request->all();
+        $is_driver = config('carpoolear.module_validated_drivers', false) && (isset($data['user_be_driver']) || $me->driver_is_verified);
+        // var_dump($is_driver);die;
+        $profile = $this->userLogic->update($me, $data, $is_driver);
+        if (! $profile) {
+            throw new ExceptionWithErrors('Could not update user.', $this->userLogic->getErrors());
+        }
+
+        // Check if user's phone number contains any banned numbers
+        if (isset($data['mobile_phone'])) {
+            $banned_phones = config('carpoolear.banned_phones', []);
+            if (! empty($banned_phones)) {
+                $user_phone = $data['mobile_phone'];
+                foreach ($banned_phones as $banned_phone) {
+                    if (str_contains($user_phone, $banned_phone)) {
+                        $this->userLogic->update($profile, ['banned' => 1], false, true);
+                        \Log::info('User banned due to phone number containing banned number: '.$user_phone.' (matched: '.$banned_phone.')');
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $this->item($profile, new ProfileTransformer($me));
+    }
+
+    public function adminUpdate(Request $request)
+    {
+        $me = auth()->user();
+        if (! $me->is_admin) {
+            throw new ExceptionWithErrors('Access denied. Admin privileges required.');
+        }
+
+        $data = $request->all();
+        $user = null;
+
+        // Extract user ID from the request
+        if (isset($data['user']) && isset($data['user']['id'])) {
+            $userId = $data['user']['id'];
+            $user = $this->userLogic->show($me, $userId);
+            unset($data['user']);
+        } else {
+            throw new ExceptionWithErrors('User ID is required for admin update.');
+        }
+
+        if (! $user) {
+            throw new ExceptionWithErrors('User not found.');
+        }
+
+        $changedKeys = $this->adminUpdateChangedKeys($user, $data);
+        $wasIdentityValidated = (bool) $user->identity_validated;
+        $profile = $this->userLogic->update($user, $data, false, true);
+        if (! $profile) {
+            throw new ExceptionWithErrors('Could not update user.', $this->userLogic->getErrors());
+        }
+
+        if ((bool) $profile->identity_validated !== $wasIdentityValidated) {
+            app(IdentityVerificationOutcome::class)->emit([
+                'user_id' => $profile->id,
+                'method' => IdentityVerificationOutcome::METHOD_ADMIN,
+                'name' => IdentityVerificationOutcome::NAME_ADMIN_IDENTITY_EDITED,
+                'reason' => $profile->identity_validated ? IdentityVerificationOutcome::REASON_VALIDATED : IdentityVerificationOutcome::REASON_UNVALIDATED,
+                'related_type' => 'users',
+                'related_id' => $profile->id,
+                'metadata' => ['admin_id' => $me->id],
+            ]);
+        }
+
+        if ($changedKeys !== []) {
+            AdminActionLogger::log(
+                $me,
+                AdminActionLog::ACTION_USER_UPDATE,
+                (int) $profile->id,
+                ['keys' => $changedKeys]
+            );
+        }
+
+        return $this->item($profile, new ProfileTransformer($me));
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return list<string>
+     */
+    private function adminUpdateChangedKeys(User $user, array $data): array
+    {
+        $changed = [];
+        foreach ($data as $key => $value) {
+            if (! is_string($key) || in_array($key, ['user', 'password_confirmation'], true)) {
+                continue;
+            }
+            if ($key === 'password') {
+                if ($value) {
+                    $changed[] = 'password';
+                }
+
+                continue;
+            }
+            if ($user->getAttribute($key) != $value) {
+                $changed[] = $key;
+            }
+        }
+
+        return $changed;
+    }
+
+    public function updatePhoto(Request $request)
+    {
+        $me = auth()->user();
+        $profile = $this->userLogic->updatePhoto($me, $request->all());
+        if (! $profile) {
+            throw new ExceptionWithErrors('Could not update user.', $this->userLogic->getErrors());
+        }
+
+        return $this->item($profile, new ProfileTransformer($me));
+    }
+
+    public function show($id = null)
+    {
+        $me = auth()->user();
+        if (! ($id > 0)) {
+            $id = $me->id;
+        }
+        $profile = $this->userLogic->show($me, $id);
+        if (! $profile) {
+            throw new ExceptionWithErrors('Users not found.', $this->userLogic->getErrors());
+        }
+
+        $this->hydratePrivateNoteForAdminViewer($me, $profile);
+
+        // Set validate_by_date for pre-cutoff users on first /users/me when grace days apply and enforcement is on (not optional-only; new users use cutoff, not this date)
+        if ($profile->id === $me->id) {
+            $days = (int) config('carpoolear.identity_validation_days_for_current_users', 0);
+            if (
+                IdentityValidationHelper::enforcementIsActive()
+                && $days > 0
+                && $profile->validate_by_date === null
+                && ! IdentityValidationHelper::isUserCreatedOnOrAfterCutoff($profile)
+            ) {
+                $profile->validate_by_date = now()->addDays($days);
+                $profile->save();
+                $profile = $profile->fresh();
+            }
+        }
+
+        return $this->item($profile, new ProfileTransformer($me));
+    }
+
+    private function hydratePrivateNoteForAdminViewer(User $viewer, User $profile): void
+    {
+        // UserRepository::show masks private_note by default; admins need it in admin edit flows.
+        if (! $viewer->is_admin) {
+            return;
+        }
+
+        $profile->private_note = User::query()->whereKey($profile->id)->value('private_note');
+    }
+
+    /**
+     * Get visible badges for a user.
+     */
+    public function badges($id = null)
+    {
+        $me = auth()->user();
+        if (! ($id > 0) || $id === 'me') {
+            $id = $me->id;
+        }
+        $user = User::find($id);
+        if (! $user) {
+            throw new ExceptionWithErrors('User not found.');
+        }
+        $badges = $user->badges()
+            ->where('visible', true)
+            ->get();
+
+        $membership = app(ClubCarpoolearMembershipService::class);
+        $badges = $membership->filterVisibleBadges($user, $badges);
+
+        return UserBadgeResource::collection($badges);
+    }
+
+    public function index(Request $request)
+    {
+        $search_text = null;
+        if ($request->has('value')) {
+            $search_text = $request->get('value');
+        }
+        $users = $this->userLogic->index(auth()->user(), $search_text);
+
+        return $this->collection($users, new ProfileTransformer(auth()->user()));
+    }
+
+    public function searchUsers(Request $request)
+    {
+        $search_text = null;
+        if ($request->has('name')) {
+            $search_text = $request->get('name');
+        }
+        $users = $this->userLogic->searchUsers($search_text);
+
+        return $this->collection($users, new ProfileTransformer(auth()->user()));
+    }
+
+    public function registerDonation(Request $request)
+    {
+        $donation = new Donation;
+        if ($request->has('has_donated')) {
+            $donation->has_donated = $request->get('has_donated');
+        }
+        if ($request->has('has_denied')) {
+            $donation->has_denied = $request->get('has_denied');
+        }
+        if ($request->has('ammount')) {
+            $donation->ammount = $request->get('ammount');
+        }
+        if ($request->has('trip_id')) {
+            $donation->trip_id = $request->get('trip_id');
+        }
+        $user = null;
+        if ($request->has('user')) {
+            $user = new \stdClass;
+            $user->id = intval($request->get('user'));
+            if (! $user->id > 0) {
+                $user->id = 164619; // donador anonimo
+            }
+        } else {
+            $user = auth()->user();
+        }
+        $donation = $this->userLogic->registerDonation($user, $donation);
+
+        return $donation;
+    }
+
+    public function bankData(Request $request)
+    {
+        $data = $this->userLogic->bankData();
+
+        return json_encode($data);
+    }
+
+    public function terms(Request $request)
+    {
+        $lang = $request->has('lang') ? $request->get('lang') : '';
+        $data = $this->userLogic->termsText($lang);
+
+        return json_encode($data);
+    }
+
+    public function changeBooleanProperty($property, $value, Request $request)
+    {
+        $allowed = $this->userEditablePropertiesService->getChangeBooleanAllowedProperties();
+        if (! in_array($property, $allowed, true)) {
+            throw new ExceptionWithErrors('Could not update user.', [
+                'property' => ['This property cannot be changed via this endpoint.'],
+            ]);
+        }
+
+        $user = auth()->user();
+        $profile = $this->userLogic->update($user, [$property => $value > 0 ? 1 : 0], false, false);
+        if (! $profile) {
+            throw new ExceptionWithErrors('Could not update user.', $this->userLogic->getErrors());
+        }
+
+        return $this->item($profile, new ProfileTransformer($user));
+    }
+
+    /**
+     * Return Mercado Pago OAuth authorization URL for identity validation.
+     * Frontend redirects the user to this URL.
+     */
+    public function getMercadoPagoOAuthUrl(Request $request, MercadoPagoOAuthService $oauthService)
+    {
+        if (! config('carpoolear.identity_validation_enabled', false)) {
+            throw new ExceptionWithErrors('Identity validation is not available.', [], 503);
+        }
+        if (! config('carpoolear.identity_validation_mercado_pago_enabled', false)) {
+            throw new ExceptionWithErrors('Identity validation with Mercado Pago is not available.', [], 503);
+        }
+        $clientId = config('services.mercadopago.client_id');
+        if (empty($clientId) || trim($clientId) === '') {
+            throw new ExceptionWithErrors('Mercado Pago OAuth is not configured. Set MERCADO_PAGO_CLIENT_ID and related env vars.', [], 503);
+        }
+
+        $user = auth()->user();
+
+        if (empty($user->nro_doc) || trim($user->nro_doc) === '') {
+            throw new ExceptionWithErrors('User must have DNI (nro_doc) set to validate identity.', ['nro_doc' => ['required']]);
+        }
+
+        $state = bin2hex(random_bytes(16));
+        $attemptId = (string) Str::uuid();
+        $surface = $request->query('surface');
+        $platform = $request->query('platform');
+        $appVersion = $request->query('app_version');
+        $authResult = $oauthService->getAuthorizationUrl($state);
+
+        $cachePayload = [
+            'user_id' => $user->id,
+            'attempt_id' => $attemptId,
+            'surface' => $surface,
+            'platform' => $platform,
+            'app_version' => $appVersion,
+        ];
+
+        if (is_array($authResult)) {
+            $authorizationUrl = $authResult['authorization_url'];
+            $cachePayload['code_verifier'] = $authResult['code_verifier'];
+        } else {
+            $authorizationUrl = $authResult;
+        }
+
+        Cache::put('mp_oauth_state:'.$state, $cachePayload, 600);
+
+        app(IdentityVerificationOutcome::class)->emit([
+            'user_id' => $user->id,
+            'method' => IdentityVerificationOutcome::METHOD_MERCADO_PAGO,
+            'name' => IdentityVerificationOutcome::NAME_ATTEMPT_STARTED,
+            'attempt_id' => $attemptId,
+            'surface' => $surface,
+            'platform' => $platform,
+            'app_version' => $appVersion,
+        ]);
+
+        return response()->json(['authorization_url' => $authorizationUrl]);
+    }
+
+    public function deleteAccountRequest(Request $request)
+    {
+        $user = auth()->user();
+
+        // Create a new delete account request
+        $deleteRequest = new DeleteAccountRequest;
+        $deleteRequest->user_id = $user->id;
+        $deleteRequest->date_requested = now();
+        $deleteRequest->action_taken = DeleteAccountRequest::ACTION_REQUESTED;
+        $deleteRequest->save();
+
+        // Send email notification to admin using the same mechanism as password reset
+        $adminEmail = 'carpoolear@stsrosario.org.ar';
+        $adminUrl = 'https://carpoolear.com.ar/app/admin';
+
+        // Queue the email sending job instead of sending synchronously
+        SendDeleteAccountRequestEmail::dispatch($adminEmail, $adminUrl)
+            ->onQueue('emails') // Use a dedicated queue for emails
+            ->delay(now()->addSeconds(10)); // Add a small delay to prevent immediate retries
+
+        return response()->json([
+            'message' => 'Delete account request created successfully',
+            'request_id' => $deleteRequest->id,
+        ], 201);
+    }
+
+    /**
+     * Automated account deletion or anonymization based on user data.
+     * Does not create DeleteAccountRequest. Logs the action.
+     */
+    public function deleteAccount(Request $request)
+    {
+        $user = auth()->user();
+        $token = JWTAuth::getToken();
+
+        $hasTrips = $user->trips()->exists() || $user->tripsAsPassenger()->exists();
+        $hasRatings = $user->ratingReceived()->exists() || $user->ratingGiven()->exists();
+        $hasReferences = $user->referencesReceived()->exists();
+        $hasNegativeRatings = $user->ratings(Rating::STATE_NEGATIVO)->exists();
+
+        if ($hasNegativeRatings) {
+            return response()->json([
+                'message' => 'Debido a que tenés calificaciones negativas necesitamos que te pongas en contacto con la mesa de ayuda para proceder con el borrado de tu cuenta',
+                'error' => 'negative_ratings',
+            ], 422);
+        }
+
+        if (! $hasTrips && ! $hasRatings && ! $hasReferences) {
+            // Branch A: Delete user
+            $userId = $user->id;
+            $this->deviceLogic->logoutAllDevices($user);
+            $this->userDeletionService->deleteUser($user);
+
+            try {
+                if ($token) {
+                    JWTAuth::invalidate($token);
+                }
+            } catch (\Exception $e) {
+                \Log::error('Failed to invalidate JWT after delete: '.$e->getMessage());
+            }
+
+            \Log::info('User self-deletion: actual_delete', ['user_id' => $userId]);
+
+            return response()->json([
+                'message' => 'Cuenta eliminada exitosamente',
+                'action' => 'deleted',
+            ]);
+        }
+
+        // Branch B: Anonymize user
+        $this->deviceLogic->logoutAllDevices($user);
+        $this->anonymizationService->anonymize($user);
+
+        try {
+            if ($token) {
+                JWTAuth::invalidate($token);
+            }
+        } catch (\Exception $e) {
+            \Log::error('Failed to invalidate JWT after anonymize: '.$e->getMessage());
+        }
+
+        \Log::info('User self-deletion: anonymize', ['user_id' => $user->id]);
+
+        return response()->json([
+            'message' => 'Cuenta anonimizada exitosamente',
+            'action' => 'anonymized',
+        ]);
+    }
+}
