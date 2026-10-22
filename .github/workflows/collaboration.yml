@@ -1,4 +1,4 @@
-name: Collaboration documents (no application tests)
+name: Documentation checks
 on:
   pull_request:
   push:
@@ -16,4 +16,4 @@ jobs:
           test -s CONTRIBUTING.md
           test -s .gitignore
           test -s .github/pull_request_template.md
-          echo "Documentation validated. No application source or application tests are included." >> "$GITHUB_STEP_SUMMARY"
+          echo "Collaboration documents validated." >> "$GITHUB_STEP_SUMMARY"

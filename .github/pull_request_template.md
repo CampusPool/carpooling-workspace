@@ -1,14 +1,15 @@
-## Official issue
-Full URL: https://github.com/CampusPool/carpooling/issues/NUMBER
+## Related issue
 
-## Behavior and ownership
-What changed, what existed in the baseline, and which files do you own?
+https://github.com/CampusPool/carpooling/issues/NUMBER
+
+## Summary
+
+Describe the change and its effect on the linked issue.
 
 ## Verification
-Exact commands, isolated environment, results and screenshots. List untested behavior.
 
-## Provenance and integration
-Upstream attribution retained; no secrets/private data. Dependencies and integration conflicts:
+Commands, results and screenshots where applicable.
 
-- [ ] Another student has reviewed the change before merge.
-- [ ] Required checks pass; documentation checks are not application tests.
+## Integration notes
+
+Dependencies, schema or configuration changes, and remaining limitations.

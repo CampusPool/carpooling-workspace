@@ -1,7 +1,10 @@
-# CampusPool team workspace
+# CampusPool development workspace
 
-Private development and review repository for CampusPool. The application baseline has **not been uploaded**; this repository contains collaboration documents only.
+Private repository for team development, integration and code review. The application baseline is pending distribution.
 
-The official submission repository and all 44 issues remain at [CampusPool/carpooling](https://github.com/CampusPool/carpooling). Use the [existing Project](https://github.com/orgs/CampusPool/projects/2). Do not duplicate issues here.
+- [Official repository and issues](https://github.com/CampusPool/carpooling)
+- [Project board](https://github.com/orgs/CampusPool/projects/2)
+- [Sprint plan and module assignments](https://github.com/CampusPool/carpooling/blob/docs/se-dbms-backlog-2026-10-12/docs/SPRINT_PLAN.md)
+- [Contribution guide](CONTRIBUTING.md)
 
-Sprint 1 ends 23 October 2026; Sprint 2 runs 26–30 October. See [contribution workflow](CONTRIBUTING.md). Source distribution awaits explicit owner authorization after file-manifest and license review. Green documentation checks provide no application-test evidence.
+Sprint 1: 19–23 October 2026. Sprint 2: 26–30 October 2026.

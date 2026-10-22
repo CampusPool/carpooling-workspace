@@ -1,15 +1,12 @@
 # Contributing
 
-1. Wait for the approved, attributed application baseline. Do not copy the private prototype or reference artifacts without the owner's separate authorization.
-2. Select your assigned [official issue](https://github.com/CampusPool/carpooling/issues). Branch from current `main`, for example `feature/17-route-matching`.
-3. Make genuine changes within the agreed file ownership. Ask the integration coordinator before modifying shared routes, migrations, dependency locks or frontend entrypoints.
-4. Use synthetic users and an isolated database. Never run `migrate:fresh`, destructive test suites or cleanup against the persistent demo MySQL database. Baseline-specific commands will accompany the approved distribution.
-5. Open a focused PR here. Reference the full official issue URL; cross-repository links do not automatically close it. Include before/after behavior, exact test command and result, screenshots where relevant, and upstream provenance.
-6. A different student reviews and verifies the change. Maintainers integrate only after approval and relevant checks. Documentation CI is not application CI; add real application checks when the baseline is authorized.
-7. Reviewed integrated work moves to the official repository only through a separately reviewed integration PR. No direct pushes to official `main`, invented reviews, disguised authorship or copied contribution claims.
+1. Select the assigned issue in [CampusPool/carpooling](https://github.com/CampusPool/carpooling/issues).
+2. Create a feature branch from `main`, using the branch listed in the sprint plan.
+3. Keep changes within the assigned module. Coordinate edits to shared services, routes, migrations and dependency locks with the maintainer.
+4. Run the relevant tests with synthetic fixtures and an isolated database. Do not run database resets against the demo installation.
+5. Open a PR in this repository. Link the official issue, describe the change and include test results and UI screenshots where applicable.
+6. Obtain review from another team member before merging. Integrate approved work into the official repository through a separate PR.
 
-Arjun (`arjunsrikanthh`, also `noqtar`) coordinates integration; Zayaan (`zayaan-06`) owns UI integration; Nikhil (`NikhilJoshi441`) owns search/matching; Nithesh (`NitheshMogaveer777`) owns database integrity/lifecycle verification. These are responsibilities, not claims of prior authorship. Course-specific team eligibility and contributions require instructor confirmation.
+Use full issue URLs for cross-repository references. Keep credentials, personal data, database dumps and reference captures out of commits. Retain third-party license notices and attribution. Plain SQL migrations and assessed queries belong in source control; database backups do not.
 
-Never commit credentials, personal records, private trip coordinates, DB dumps, reference-app artifacts or code whose redistribution obligations are unresolved. Retain original notices and separate upstream code from subsequent modifications.
-
-Current package boundaries, source/license gates and demo instructions are being reviewed in [official PR #45](https://github.com/CampusPool/carpooling/pull/45). Review the five consolidated documents there before starting; the application baseline is still withheld. Plain SQL migrations and assessed queries may be tracked after authorization; database dumps/backups must stay excluded.
+Module ownership and integration order are maintained in the [sprint plan](https://github.com/CampusPool/carpooling/blob/docs/se-dbms-backlog-2026-10-12/docs/SPRINT_PLAN.md).
