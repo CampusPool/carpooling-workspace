@@ -1,0 +1,23 @@
+# Portable SYNTHETIC routes for college DEMO ONLY; not driving directions.
+services:
+  demo-router:
+    image: python:3.12-alpine
+    working_dir: /work
+    volumes:
+      - ./demo-router.py:/work/demo-router.py:ro
+    command: python /work/demo-router.py
+    networks: [appnet]
+  app:
+    depends_on:
+      demo-router: {condition: service_started}
+    environment:
+      MOBILITY_ROUTING_PROVIDER: osrm
+      MOBILITY_ROUTING_CAR_BASE_URL: http://demo-router:5000
+      MOBILITY_ROUTING_BIKE_BASE_URL: http://demo-router:5000
+      MOBILITY_ROUTING_FOOT_BASE_URL: http://demo-router:5000
+      MOBILITY_ROUTING_CAR_PROFILE: car
+      MOBILITY_ROUTING_BIKE_PROFILE: bike
+      MOBILITY_ROUTING_FOOT_PROFILE: foot
+      MOBILITY_ROUTING_CAR_EXPECTED_DATA_VERSION: "car|crop_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|profile_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      MOBILITY_ROUTING_BIKE_EXPECTED_DATA_VERSION: "bike|crop_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|profile_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      MOBILITY_ROUTING_FOOT_EXPECTED_DATA_VERSION: "foot|crop_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|profile_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

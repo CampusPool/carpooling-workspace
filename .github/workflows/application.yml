@@ -1,0 +1,23 @@
+name: CampusPool application verification
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  portable-campus-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify attributed package and isolated application
+        working-directory: prototype
+        run: sh reproduction/verify-package.sh
+      - name: Verify fresh-start synthetic booking journey
+        working-directory: prototype
+        run: |
+          set -eu
+          sh reproduction/start-local.sh
+          trap 'sh reproduction/stop-local.sh' EXIT
+          python3 reproduction/smoke-booking.py
