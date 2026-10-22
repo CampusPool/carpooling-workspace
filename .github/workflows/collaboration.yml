@@ -1,0 +1,19 @@
+name: Collaboration documents (no application tests)
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  collaboration-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate collaboration documents only
+        run: |
+          test -s README.md
+          test -s CONTRIBUTING.md
+          test -s .gitignore
+          test -s .github/pull_request_template.md
+          echo "Documentation validated. No application source or application tests are included." >> "$GITHUB_STEP_SUMMARY"

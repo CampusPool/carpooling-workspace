@@ -1,0 +1,21 @@
+# Credentials, generated data and local state
+.env
+.env.*
+!.env.example
+!.env.testing.example
+/vendor/
+/node_modules/
+/storage/
+/bootstrap/cache/
+*.log
+*.sql
+*.sqlite*
+*.db
+.DS_Store
+/.jarvis/
+/reference/
+/research/
+/analysis/
+/tools/rea/
+/artifacts/
+/evidence/
