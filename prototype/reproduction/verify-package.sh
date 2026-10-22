@@ -19,15 +19,17 @@ mkdir -p storage/framework/cache/data storage/framework/sessions storage/framewo
 cleanup() {
   status=$?
   if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
+    # Dependencies run as root in Docker; remove generated files INSIDE this
+    # isolated package mount, never via a cross-device host mv/chown.
+    docker compose -f reproduction/compose.yml run --rm --no-deps --user 0 deps       sh -c 'rm -rf /var/www/vendor /var/www/storage /var/www/bootstrap/cache/*' >/dev/null 2>&1 || true
     docker compose -f reproduction/compose.yml down -v --remove-orphans >/dev/null 2>&1 || true
   fi
   rm -f reproduction/package.env
-  # Compose/Laravel may create an empty project-local env file while probing.
-  # Never leave that generated file in the distributable package.
   rm -f .env
-  [ ! -d vendor ] || mv vendor "/tmp/${project}-vendor" || true
-  [ ! -d storage ] || mv storage "/tmp/${project}-storage" || true
-  find bootstrap/cache -type f -delete 2>/dev/null || true
+  if [ -d vendor ] || [ -d storage ]; then
+    printf '%s\n' 'Generated package runtime files remain; inspect cleanup permissions.' >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
