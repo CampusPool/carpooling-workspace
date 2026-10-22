@@ -8,3 +8,7 @@ Private repository for team development, integration and code review. The applic
 - [Contribution guide](CONTRIBUTING.md)
 
 Sprint 1: 19–23 October 2026. Sprint 2: 26–30 October 2026.
+
+## Run portable campus demonstration
+
+See [portable demo instructions](prototype/reproduction/PORTABLE_DEMO.md). This uses **synthetic straight-line routes**, not real driving directions.

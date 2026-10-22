@@ -36,11 +36,11 @@ sh reproduction/start-local.sh  # waits for the page to respond
 sh reproduction/stop-local.sh  # preserves local configuration and database volume
 ```
 
-The interactive stack starts the UI and synthetic account database. To configure providers, copy `config/.env.example` to the ignored `reproduction/package.env` and edit it before starting; the helper preserves this file. Run verification from a separate clean clone.
+The interactive stack starts the UI, a synthetic routing service and synthetic account database. It exercises the booking workflow but **does not provide road-accurate routing**. To configure providers, copy `config/.env.example` to the ignored `reproduction/package.env` and edit it before starting; the helper preserves this file. Run verification from a separate clean clone.
 
-The synthetic routing fixture is used by the focused tests only. The browser
+The default interactive startup uses a bundled **synthetic straight-line routing service**; the browser
 UI has no bundled road graph or provider key. The `.env.example` contains no external OSRM endpoint,
-so interactive search requires separately reviewed
+so live/road-accurate interactive search requires separately reviewed
 `MOBILITY_ROUTING_PROVIDER=osrm`, per-mode `MOBILITY_ROUTING_{CAR,BIKE,FOOT}_PROFILE`,
 `MOBILITY_ROUTING_{CAR,BIKE,FOOT}_BASE_URL` endpoints and matching
 `MOBILITY_ROUTING_{CAR,BIKE,FOOT}_EXPECTED_DATA_VERSION` pins, plus any

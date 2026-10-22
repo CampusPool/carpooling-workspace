@@ -8,10 +8,10 @@ docker compose version >/dev/null
 project=${COMPOSE_PROJECT_NAME:-campuspool-interactive}
 export COMPOSE_PROJECT_NAME="$project"
 printf '%s\n' "$project" > reproduction/.local-project
-[ -f reproduction/package.env ] || cp config/.env.example reproduction/package.env
+python3 reproduction/configure-demo-env.py
 mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs storage/suburbs storage/geojson bootstrap/cache
-docker compose -f reproduction/compose.yml -f reproduction/compose.local.yml config --quiet
-docker compose -f reproduction/compose.yml -f reproduction/compose.local.yml up -d --build app
+docker compose -f reproduction/compose.yml -f reproduction/compose.local.yml -f reproduction/compose.demo.yml config --quiet
+docker compose -f reproduction/compose.yml -f reproduction/compose.local.yml -f reproduction/compose.demo.yml up -d --build app
 attempt=0
 until curl -fsS --max-time 2 http://127.0.0.1:18180/mobility/ >/dev/null 2>&1; do
   attempt=$((attempt + 1))
@@ -21,4 +21,4 @@ until curl -fsS --max-time 2 http://127.0.0.1:18180/mobility/ >/dev/null 2>&1; d
   fi
   sleep 1
 done
-printf '%s\n' 'CampusPool UI: http://127.0.0.1:18180/mobility/'
+printf '%s\n' 'CampusPool SYNTHETIC demo (not real routes): http://127.0.0.1:18180/mobility/?demo=campus-route'
