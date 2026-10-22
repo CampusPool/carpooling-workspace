@@ -1,0 +1,64 @@
+diff --git a/app/Repository/TripRepository.php b/app/Repository/TripRepository.php
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -101,7 +101,9 @@
+         // Get trip info for price calculations and route data
+         $tripInfo = $this->getTripInfo($points);
+ 
+-        $data = $this->capSeatPriceAtMaximum($data, $tripInfo, $data['rear_max_two_passengers'] ?? false);
++        if (! \STS\Mobility\Routing\TrustedRouteContext::active()) {
++            $data = $this->capSeatPriceAtMaximum($data, $tripInfo, $data['rear_max_two_passengers'] ?? false);
++        }
+ 
+         $trip = Trip::create($data);
+ 
+@@ -147,7 +149,11 @@
+         $this->generateTripFriendVisibility($trip);
+ 
+         if (trim((string) $trip->description) !== '') {
+-            $this->dispatchContributionCheck($trip);
++            if (\STS\Mobility\Routing\TrustedRouteContext::active()) {
++                DB::afterCommit(fn () => $this->dispatchContributionCheck($trip));
++            } else {
++                $this->dispatchContributionCheck($trip);
++            }
+         }
+ 
+         // TODO: check if trip.needs_payment (temp flag), and if total_trips_created > 2, we need to pay
+@@ -798,6 +804,10 @@
+ 
+     public function getTripInfo($points)
+     {
++        if (\STS\Mobility\Routing\TrustedRouteContext::active()) {
++            return \STS\Mobility\Routing\TrustedRouteContext::tripInfoFor($points);
++        }
++
+         $hashedPoints = hash('sha256', json_encode($points));
+         $cacheBypass = (bool) config('carpoolear.trip_route_cache_bypass', false);
+ 
+diff --git a/app/Services/Logic/TripsManager.php b/app/Services/Logic/TripsManager.php
+--- a/app/Services/Logic/TripsManager.php
++++ b/app/Services/Logic/TripsManager.php
+@@ -220,11 +220,17 @@
+                     $parentTrip = $this->tripRepo->update($parentTrip, $parentData);
+                 }
+             }
+-            event(new CreateEvent($trip));
+-
+-            $friendTripAlertService = app(FriendTripAlertService::class);
+-            if ($friendTripAlertService->isImmediatelyVisible($trip)) {
+-                $friendTripAlertService->notifyIfVisible($trip);
++            $notifyCreated = static function () use ($trip): void {
++                event(new CreateEvent($trip));
++                $friendTripAlertService = app(FriendTripAlertService::class);
++                if ($friendTripAlertService->isImmediatelyVisible($trip)) {
++                    $friendTripAlertService->notifyIfVisible($trip);
++                }
++            };
++            if (\STS\Mobility\Routing\TrustedRouteContext::active()) {
++                \Illuminate\Support\Facades\DB::afterCommit($notifyCreated);
++            } else {
++                $notifyCreated();
+             }
+ 
+             return $trip;

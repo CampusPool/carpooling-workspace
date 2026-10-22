@@ -1,0 +1,53 @@
+--- a/app/Repository/PassengersRepository.php
++++ b/app/Repository/PassengersRepository.php
+@@ -94,6 +94,9 @@
+     public function newRequest($tripId, $user, $data = [])
+     {
+         \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
++        if (app(\STS\Mobility\Journeys\PrivateScheduledAdmissionService::class)->managed((int) $tripId)) {
++            throw new \STS\Mobility\Segments\SegmentException('PRIVATE_SCHEDULE_CARD_CONSENT_REQUIRED', 409);
++        }
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->newRequest((int) $tripId, $user, $data);
+         }
+@@ -121,4 +121,7 @@
+     private function changeRequestState($tripId, $userId, $newState, $criterias, $canceledState = null)
+     {
+         \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
++        if (app(\STS\Mobility\Journeys\PrivateScheduledAdmissionService::class)->managed((int) $tripId)) {
++            return app(\STS\Mobility\Journeys\PrivateScheduledAdmissionService::class)->changeState((int) $tripId, (int) $userId, (int) $newState, $criterias, $canceledState === null ? null : (int) $canceledState);
++        }
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+@@ -200,6 +203,9 @@
+     public function acceptRequest($tripId, $acceptedUserId, $user, $data)
+     {
+         \STS\Mobility\Dispatch\DispatchBoundary::denyLegacy((int) $tripId);
++        if (app(\STS\Mobility\Journeys\PrivateScheduledAdmissionService::class)->managed((int) $tripId)) {
++            return app(\STS\Mobility\Journeys\PrivateScheduledAdmissionService::class)->accept((int) $tripId, (int) $acceptedUserId);
++        }
+         if (\STS\Mobility\Segments\SegmentBookingService::managed((int) $tripId)) {
+             return app(\STS\Mobility\Segments\SegmentBookingService::class)->acceptRequest((int) $tripId, (int) $acceptedUserId);
+         }
+--- a/app/Transformers/TripTransformer.php
++++ b/app/Transformers/TripTransformer.php
+@@ -38,6 +38,9 @@
+      */
+     public function transform(Trip $trip)
+     {
++        if (\STS\Mobility\Journeys\PrivateScheduledAdmissionService::managed((int) $trip->id) && (! $this->user || ! \STS\Mobility\Dispatch\DispatchBoundary::canView((int) $trip->id, $this->user))) {
++            return ['id' => (int) $trip->id, 'private' => true, 'points' => [], 'state' => $trip->state];
++        }
+         $data = [
+             'id' => $trip->id,
+             'from_town' => $trip->from_town,
+--- a/app/Services/Logic/TripsManager.php
++++ b/app/Services/Logic/TripsManager.php
+@@ -224,7 +224,7 @@
+                 }
+             }
+             $notifyCreated = static function () use ($trip): void {
+-                if (\STS\Mobility\Dispatch\DispatchTripPolicy::managed((int) $trip->id)) {
++                if (\STS\Mobility\Dispatch\DispatchTripPolicy::managed((int) $trip->id) || \STS\Mobility\Journeys\PrivateScheduledAdmissionService::managed((int) $trip->id)) {
+                     return;
+                 }
+                 event(new CreateEvent($trip));

@@ -1,0 +1,207 @@
+<?php
+
+return [
+    'name_app' => env('NAME_APP', 'Carpoolear'),
+    'donation_month_days' => env('DONATION_MONTH_DAYS', '0'),
+    'donation_trips_count' => env('DONATION_TRIPS_COUNT', '20'),
+    'donation_trips_offset' => env('DONATION_TRIPS_OFFSET', '0'),
+    'donation_trips_rated' => env('DONATION_TRIPS_RATED', '2'),
+    'donation_ammount_needed' => env('DONATION_AMMOUNT_NEEDED', '1000'),
+    'banner_url' => env('BANNER_URL', ''),
+    'banner_url_mobile' => env('BANNER_URL_MOBILE', ''),
+    'banner_image' => env('BANNER_IMAGE', ''),
+    'banner_image_mobile' => env('BANNER_IMAGE_MOBILE', ''),
+    'banner_url_cordova' => env('BANNER_URL_CORDOVA', ''),
+    'banner_url_cordova_mobile' => env('BANNER_URL_CORDOVA_MOBILE', ''),
+    'banner_image_cordova' => env('BANNER_IMAGE_CORDOVA', ''),
+    'banner_image_cordova_mobile' => env('BANNER_IMAGE_CORDOVA_MOBILE', ''),
+    'target_app' => env('TARGET_APP', 'carpoolear'),
+    'recaptcha_secret_key' => env('RECAPTCHA_SECRET_KEY', ''),
+    'module_coordinate_by_message' => env('MODULE_COORDINATE_BY_MESSAGE', false),
+    'module_user_request_limited_enabled' => env('MODULE_USER_REQUEST_LIMITED_ENABLED', false),
+    'module_user_request_limited_hours_range' => (int) env('MODULE_USER_REQUEST_LIMITED_HOURS_RANGE', 2),
+    'module_send_full_trip_message' => env('MODULE_SEND_FULL_TRIP_MESSAGE', false),
+    'module_unaswered_message_limit' => env('MODULE_UNASWERED_MESSAGE_LIMIT', false),
+    // When true, the Vue app shows response speed and response rate for the driver on trip cards (TripDriver.vue).
+    'module_conversation_average_delay' => env('MODULE_CONVERSATION_AVERAGE_DELAY', false),
+    'module_trip_seats_payment' => env('MODULE_TRIP_SEATS_PAYMENT', false),
+    'module_unique_doc_phone' => env('MODULE_UNIQUE_DOC_PHONE', false),
+    'module_validated_drivers' => env('MODULE_VALIDATED_DRIVERS', false),
+    'module_facebook_profile_url_enabled' => env('MODULE_FACEBOOK_PROFILE_URL_ENABLED', false),
+    'module_trip_creation_payment_enabled' => env('MODULE_TRIP_CREATION_PAYMENT_ENABLED', false),
+    'module_trip_creation_payment_amount_cents' => (int) env('MODULE_TRIP_CREATION_PAYMENT_AMOUNT_CENTS', 1500),
+    'module_trip_creation_payment_trips_threshold' => (int) env('MODULE_TRIP_CREATION_PAYMENT_TRIPS_THRESHOLD', 2),
+    // Frontend app base URL (e.g. for payment redirects, OAuth callbacks). Defaults to APP_URL.
+    'frontend_url' => env('FRONTEND_URL', env('APP_URL', 'http://localhost:8080')),
+    'platform_donations_api_enabled' => filter_var(env('PLATFORM_DONATIONS_API_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+    'platform_donations_qr_enabled' => filter_var(env('PLATFORM_DONATIONS_QR_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+
+    // Minimum app version enforcement for Capacitor (null = no enforcement)
+    'min_version_android' => env('MIN_VERSION_ANDROID') ? (int) env('MIN_VERSION_ANDROID') : null,
+    'min_version_android_semver' => env('MIN_VERSION_ANDROID_SEMVER') ?: null, // e.g. "2.1.10" for fallback comparison when plugin unavailable
+    'min_version_ios' => env('MIN_VERSION_IOS') ?: null,
+    'module_seat_price_enabled' => env('MODULE_SEAT_PRICE_ENABLED', false),
+    'module_max_price_enabled' => env('MODULE_MAX_PRICE_ENABLED', false),
+    'module_max_price_fuel_price' => (float) env('MODULE_MAX_PRICE_FUEL_PRICE', 1500),
+    'module_max_price_price_variance_tolls' => (float) env('MODULE_MAX_PRICE_PRICE_VARIANCE_TOLLS', 10),
+    'module_max_price_price_variance_tolls_costa_atlantica' => (float) env('MODULE_MAX_PRICE_PRICE_VARIANCE_TOLLS_COSTA_ATLANTICA', 25),
+    'module_max_price_price_variance_max_extra' => (float) env('MODULE_MAX_PRICE_PRICE_VARIANCE_MAX_EXTRA', 15),
+    'module_max_price_kilometer_by_liter' => (float) env('MODULE_MAX_PRICE_KILOMETER_BY_LITER', 10),
+    'module_max_price_show_breakdown' => filter_var(env('MODULE_MAX_PRICE_SHOW_BREAKDOWN', true), FILTER_VALIDATE_BOOLEAN),
+
+    'manual_identity_validation_cost_cents' => (int) env('MANUAL_IDENTITY_VALIDATION_COST_CENTS', 0),
+    // Max document submissions per paid manual validation request (including the first upload).
+    'manual_identity_validation_max_submissions' => (int) env('MANUAL_IDENTITY_VALIDATION_MAX_SUBMISSIONS', 3),
+    // Days to keep photos after admin rejects a manual validation before auto-purging.
+    'manual_identity_validation_rejected_photo_retention_days' => (int) env('MANUAL_IDENTITY_VALIDATION_REJECTED_PHOTO_RETENTION_DAYS', 7),
+
+    // Master switch: when false, hide identity validation UI and do not enforce (except admin flows).
+    'identity_validation_enabled' => filter_var(env('IDENTITY_VALIDATION_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+    // When true (and enabled), show flows but do not block restricted actions
+    'identity_validation_optional' => filter_var(env('IDENTITY_VALIDATION_OPTIONAL', false), FILTER_VALIDATE_BOOLEAN),
+    // Identity validation: enable/disable MP OAuth and manual validation (frontend shows only enabled options)
+    'identity_validation_mercado_pago_enabled' => env('IDENTITY_VALIDATION_MERCADO_PAGO_ENABLED', false),
+    'identity_validation_manual_enabled' => env('IDENTITY_VALIDATION_MANUAL_ENABLED', false),
+    // New users: created_on_or_after this date (Y-m-d), see IDENTITY_VALIDATION_NEW_USERS_DATE.
+    'identity_validation_new_users_date' => env('IDENTITY_VALIDATION_NEW_USERS_DATE', null),
+    // When enforcement is on: require "new" users (per cutoff) to validate before restricted actions
+    'identity_validation_required_new_users' => filter_var(env('IDENTITY_VALIDATION_REQUIRED_NEW_USERS', false), FILTER_VALIDATE_BOOLEAN),
+    // When set (positive integer), pre-cutoff users without validate_by_date get it on first /users/me only while enforcement is active (enabled and not optional)
+    'identity_validation_days_for_current_users' => (int) env('IDENTITY_VALIDATION_DAYS_FOR_CURRENT_USERS', 0),
+    // QR payment for manual validation (no physical device needed; see docs in config or README)
+    'identity_validation_manual_qr_enabled' => env('IDENTITY_VALIDATION_MANUAL_QR_ENABLED', false),
+    'qr_payment_pos_external_id' => env('MERCADO_PAGO_QR_PAYMENT_POS_EXTERNAL_ID', ''),
+
+    // Document/identity image uploads: allowed types, size limit, HEIC conversion
+    'image_upload_allowed_mimes' => ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
+    'image_upload_allowed_extensions' => ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'],
+    'image_upload_max_bytes' => (int) env('IMAGE_UPLOAD_MAX_BYTES', 10 * 1024 * 1024),
+    'image_upload_convert_heic_to_jpeg' => filter_var(env('IMAGE_UPLOAD_CONVERT_HEIC', true), FILTER_VALIDATE_BOOLEAN),
+
+    // List of banned words that will trigger user ban if found in their name or in trip descriptions
+    'banned_words_names' => [
+        'admin',
+        'administrator',
+        'moderator',
+        'support',
+        'helpdesk',
+        'carpoolear',
+        'staff',
+        'system',
+        'robot',
+        'carpy',
+    ],
+
+    'banned_words_trip_description' => [
+        'carpy',
+    ],
+
+    // List of banned phone numbers that will trigger user ban if found in their profile or in trip descriptions
+    'banned_phones' => [
+        '1151415054',
+    ],
+
+    'trip_creation_limits' => [
+        'max_trips' => (int) env('TRIP_CREATION_LIMIT_MAX_TRIPS', 5),
+        'time_window_hours' => (int) env('TRIP_CREATION_LIMIT_TIME_WINDOW_HOURS', 24),
+    ],
+
+    // Set to true to disable auto-ban for excessive trip creation (local dev only)
+    'disable_trip_creation_limits' => env('DISABLE_TRIP_CREATION_LIMITS', false),
+
+    // Password reset rate limiting
+    // Set to true to disable rate limiting for debugging (find culprit emails)
+    // WARNING: Only disable temporarily in development/staging
+    'disable_password_reset_rate_limit' => env('DISABLE_PASSWORD_RESET_RATE_LIMIT', false),
+
+    // Email logging
+    // Set to true to enable detailed email operation logging to storage/logs/email.log
+    // Logs all password reset email operations with structured data
+    'log_emails' => env('LOG_EMAILS', false),
+    'email_log_daily_days' => env('EMAIL_LOG_DAILY_DAYS', 30),
+
+    // Support tickets
+    'support_ticket_autoclose_days' => (int) env('SUPPORT_TICKET_AUTOCLOSE_DAYS', 10),
+    'support_ticket_assignment_timeout_minutes' => (int) env('SUPPORT_TICKET_ASSIGNMENT_TIMEOUT_MINUTES', 10),
+    'support_ticket_rate_limit_create_per_hour' => (int) env('SUPPORT_TICKET_RATE_LIMIT_CREATE_PER_HOUR', 5),
+    'support_ticket_rate_limit_reply_per_hour' => (int) env('SUPPORT_TICKET_RATE_LIMIT_REPLY_PER_HOUR', 20),
+    'support_ticket_rate_limit_admin_reply_per_hour' => (int) env('SUPPORT_TICKET_RATE_LIMIT_ADMIN_REPLY_PER_HOUR', 120),
+    'support_ticket_auto_reply_user_id' => env('SUPPORT_TICKET_AUTO_REPLY_USER_ID')
+        ? (int) env('SUPPORT_TICKET_AUTO_REPLY_USER_ID')
+        : null,
+
+    // OSRM (trip-info + public map proxy). Primary = demo or self-hosted base URL without trailing slash.
+    'osrm_router_base_url' => rtrim(env('OSRM_ROUTER_BASE_URL', 'https://router.project-osrm.org'), '/'),
+    // Optional second base (same /route/v1/... paths). Used if primary times out or errors.
+    'osrm_router_fallback_base_url' => env('OSRM_ROUTER_FALLBACK_BASE_URL')
+        ? rtrim((string) env('OSRM_ROUTER_FALLBACK_BASE_URL'), '/')
+        : null,
+    // Long TTL: inter-city routes rarely need fresh geometry for map; trip-info uses same cache length for successful routes.
+    'osrm_proxy_cache_ttl_success_seconds' => (int) env('OSRM_PROXY_CACHE_TTL_SUCCESS', 31536000),
+    'osrm_proxy_cache_ttl_error_seconds' => (int) env('OSRM_PROXY_CACHE_TTL_ERROR', 3600),
+
+    // RouteCache (getTripInfo) successful route payload — default 365 days
+    'trip_route_cache_ttl_success_seconds' => (int) env('TRIP_ROUTE_CACHE_TTL_SUCCESS_SECONDS', 31536000),
+    // Debug helper: when true, getTripInfo skips RouteCache reads and writes.
+    'trip_route_cache_bypass' => filter_var(env('TRIP_ROUTE_CACHE_BYPASS', false), FILTER_VALIDATE_BOOLEAN),
+
+    // Mapbox Directions API (secret access token). Trip-info fallback when OSRM fails; not used for Leaflet proxy.
+    'mapbox_access_token' => env('MAPBOX_ACCESS_TOKEN', ''),
+
+    // Google Routes API v2 — optional future fallback; not wired in getTripInfo (see GoogleDrivingRouteService).
+    'google_routes_api_key' => env('GOOGLE_ROUTES_API_KEY', ''),
+    'google_routes_region_code' => env('GOOGLE_ROUTES_REGION_CODE', 'AR'),
+
+    // SPA route (hash router) for maintenance admin settings — exposed on api/config.
+    'maintenance_admin_path' => env('MAINTENANCE_ADMIN_PATH', '/#/admin/maintenance'),
+
+    // Admin user impersonation for support debugging (set IMPERSONATION_ENABLED=true in production).
+    'impersonation_enabled' => filter_var(env('IMPERSONATION_ENABLED', true), FILTER_VALIDATE_BOOLEAN),
+
+    // User edit property security: allowlist-based filtering for all user update paths
+    'user_edit_properties' => [
+        // NEVER editable by anyone (including admins)
+        'forbidden' => ['is_admin', 'admin_role'],
+
+        // Editable by regular users (self-edit). email is only set at registration.
+        // name is editable until identity is validated (see UserEditablePropertiesService).
+        'allowed' => [
+            'name', 'password', 'password_confirmation', 'birthday', 'gender', 'description',
+            'mobile_phone', 'emails_notifications', 'nro_doc',
+            'data_visibility',
+            'do_not_alert_request_seat', 'do_not_alert_accept_passenger',
+            'do_not_alert_pending_rates', 'do_not_alert_pricing',
+            'autoaccept_requests', 'unaswered_messages_limit',
+            'on_boarding_view',
+            'user_be_driver', 'driver_data_docs',
+            'account_number', 'account_type', 'account_bank',
+            'facebook_profile_url',
+            'locale',
+            'show_club_carpoolear_membership',
+        ],
+
+        // Additional properties editable only by admin (email only at registration for users)
+        'admin_allowed' => [
+            'email', 'banned', 'active', 'driver_is_verified',
+            'patente', 'car_description', 'private_note',
+            'facebook_profile_url',
+            'identity_validated', 'identity_validated_at',
+            'identity_validation_type', 'identity_validation_reject_reason',
+            'validate_by_date',
+        ],
+
+        // Block + log warning + Slack alert (like banned DNI)
+        'flagged' => [
+            'email', 'name', 'is_admin', 'banned', 'active',
+            'identity_validated', 'identity_validated_at',
+            'identity_validation_type', 'identity_validation_reject_reason',
+            'validate_by_date',
+        ],
+    ],
+
+    'argautos_api_base_url' => env('ARGAUTOS_API_BASE_URL', 'https://argautos.com/api/v1'),
+    'argautos_api_key' => env('ARGAUTOS_API_KEY'),
+    'argautos_request_delay_ms' => (int) env('ARGAUTOS_REQUEST_DELAY_MS', 21000),
+
+    'profile_id_format' => env('PROFILE_ID_FORMAT', '##.###.###'),
+];

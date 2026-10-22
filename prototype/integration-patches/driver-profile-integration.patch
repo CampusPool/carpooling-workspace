@@ -1,0 +1,14 @@
+--- a/app/Services/Logic/TripsManager.php
++++ b/app/Services/Logic/TripsManager.php
+@@ -98,7 +98,10 @@
+ 
+             return;
+         } else {
+-            if (! $this->userHasRequiredProfileFields($user)) {
++            $trustedDriverProfile = $this->isDriverTrip($data)
++                && \STS\Mobility\Routing\TrustedRouteContext::active()
++                && \STS\Mobility\Trust\DriverOnboardingPolicy::canonicalProfileComplete((int) $user->id, (int) ($data['car_id'] ?? 0));
++            if (! $this->userHasRequiredProfileFields($user) && ! $trustedDriverProfile) {
+                 $messageBag = new MessageBag;
+                 $messageBag->add('profile_required', 'The user profile must be complete.');
+                 $this->setErrors($messageBag);

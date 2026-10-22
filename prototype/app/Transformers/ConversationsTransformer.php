@@ -1,0 +1,140 @@
+<?php
+
+namespace STS\Transformers;
+
+use League\Fractal\TransformerAbstract;
+use STS\Models\Conversation;
+use STS\Models\Trip;
+
+class ConversationsTransformer extends TransformerAbstract
+{
+    protected $user;
+
+    public function __construct($user)
+    {
+        $this->user = $user;
+    }
+
+    /**
+     * Turn this item object into a generic array.
+     *
+     * @return array
+     */
+    public function transform(Conversation $conversation)
+    {
+        $data = [
+            'id' => $conversation->id,
+            'type' => $conversation->type,
+        ];
+
+        $trip = null;
+        if ($conversation->trip_id) {
+            $trip = Trip::find($conversation->trip_id);
+        }
+
+        if ($conversation->type === Conversation::TYPE_TRIP_CONVERSATION && $trip) {
+            $data['trip_id'] = $trip->id;
+            $data['trip_date'] = $trip->trip_date ? $trip->trip_date->toDateTimeString() : null;
+        }
+
+        $module_module_coordinate_by_message = filter_var(
+            config('carpoolear.module_coordinate_by_message'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+        if ($module_module_coordinate_by_message && $trip) {
+            // old client, maybe null
+            $tripTransformer = new TripTransformer($this->user);
+            if ($trip->return_trip_id) {
+                $returnTrip = Trip::find($trip->return_trip_id);
+                if ($returnTrip) {
+                    $data['return_trip'] = $tripTransformer->transform($returnTrip);
+                }
+            }
+            $data['trip'] = $tripTransformer->transform($trip);
+        }
+
+        switch ($conversation->type) {
+            case Conversation::TYPE_PRIVATE_CONVERSATION:
+                $width = $this->resolvePrivatePeer($conversation);
+                if ($width) {
+                    $data['title'] = $width->name;
+                    $data['image'] = $width->image ? '/image/profile/'.$width->image : '';
+                    $data['other_user_identity_validated_at'] = $width->identity_validated_at ? $width->identity_validated_at->toDateTimeString() : null;
+                } else {
+                    // Handle case where no other user is found
+                    $data['title'] = 'Unknown User';
+                    $data['image'] = '';
+                    $data['other_user_identity_validated_at'] = null;
+                }
+                break;
+            default:
+                $data['title'] = $conversation->title;
+                $data['image'] = '';
+                $data['other_user_identity_validated_at'] = null;
+                break;
+        }
+
+        $data['unread'] = ! $conversation->read($this->user);
+        $data['notifications_enabled'] = $conversation->notificationsEnabled($this->user);
+        $data['update_at'] = $conversation->updated_at ? $conversation->updated_at->toDateTimeString() : null;
+
+        $m = $conversation->messages()->orderBy('created_at', 'desc')->first();
+        if ($m) {
+            $transformer = new MessageTransformer($this->user);
+            $data['last_message'] = $transformer->transform($m);
+        } else {
+            $data['last_message'] = null;
+        }
+
+        $data['users'] = [];
+        foreach ($conversation->users as $u) {
+            $data['users'][] = [
+                'id' => $u->id,
+                'name' => $u->name,
+                'image' => $u->image ? '/image/profile/'.$u->image : '',
+                'last_connection' => $u->last_connection ? $u->last_connection->toDateTimeString() : null,
+                'identity_validated_at' => $u->identity_validated_at ? $u->identity_validated_at->toDateTimeString() : null,
+                'positive_ratings' => $u->positive_ratings,
+                'negative_ratings' => $u->negative_ratings,
+                'neutral_ratings' => $u->neutral_ratings,
+            ];
+        }
+
+        return $data;
+    }
+
+    /**
+     * Resolve the other party for a private conversation title.
+     * When a thread was polluted with extra members, prefer the latest non-viewer message author.
+     */
+    private function resolvePrivatePeer(Conversation $conversation)
+    {
+        $peers = $conversation->users()
+            ->where('users.id', '<>', $this->user->id)
+            ->get()
+            ->unique('id')
+            ->values();
+
+        if ($peers->isEmpty()) {
+            return null;
+        }
+
+        if ($peers->count() === 1) {
+            return $peers->first();
+        }
+
+        $lastForeignMessage = $conversation->messages()
+            ->where('user_id', '<>', $this->user->id)
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        if ($lastForeignMessage) {
+            $fromLastMessage = $peers->firstWhere('id', $lastForeignMessage->user_id);
+            if ($fromLastMessage) {
+                return $fromLastMessage;
+            }
+        }
+
+        return $peers->first();
+    }
+}

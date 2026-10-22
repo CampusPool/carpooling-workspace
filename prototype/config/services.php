@@ -1,0 +1,81 @@
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Third Party Services
+    |--------------------------------------------------------------------------
+    |
+    | This file is for storing the credentials for third party services such
+    | as Mailgun, Postmark, AWS and more. This file provides the de facto
+    | location for this type of information, allowing packages to have
+    | a conventional file to locate the various service credentials.
+    |
+    */
+
+    'postmark' => [
+        'token' => env('POSTMARK_TOKEN'),
+    ],
+
+    'ses' => [
+        'key' => env('AWS_ACCESS_KEY_ID'),
+        'secret' => env('AWS_SECRET_ACCESS_KEY'),
+        'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
+    ],
+
+    'resend' => [
+        'key' => env('RESEND_KEY'),
+    ],
+
+    'slack' => [
+        'notifications' => [
+            'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),
+            'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
+        ],
+        // Incoming Webhook URL for #carpoolear_mesa-de-ayuda (banned DNI attempts, etc.)
+        'banned_dni_webhook_url' => env('SLACK_BANNED_DNI_WEBHOOK_URL'),
+        // Incoming Webhook URL for forbidden profile edit attempts (e.g. is_admin, banned, etc.)
+        'forbidden_edit_webhook_url' => env('SLACK_FORBIDDEN_EDIT_WEBHOOK_URL'),
+    ],
+
+    'mercadopago' => [
+        'access_token' => env('MERCADO_PAGO_ACCESS_TOKEN'),
+        'qr_payment_access_token' => env('MERCADO_PAGO_QR_PAYMENT_ACCESS_TOKEN'),
+        'qr_payment_client_id' => env('MERCADO_PAGO_QR_PAYMENT_CLIENT_ID'),
+        'qr_payment_client_secret' => env('MERCADO_PAGO_QR_PAYMENT_CLIENT_SECRET'),
+        // Webhook application_id for the QR app (defaults to qr_payment_client_id when unset).
+        'qr_payment_application_id' => env('MERCADO_PAGO_QR_PAYMENT_APPLICATION_ID'),
+        'webhook_secret' => env('MERCADO_PAGO_WEBHOOK_SECRET'),
+        'webhook_secret_qr_payment' => env('MERCADO_PAGO_WEBHOOK_SECRET_QR_PAYMENT'),
+        'reference_salt' => env('MERCADO_PAGO_REFERENCE_SALT', 'carpoolear_2024_secure_salt'),
+        'client_id' => env('MERCADO_PAGO_CLIENT_ID'),
+        'client_secret' => env('MERCADO_PAGO_CLIENT_SECRET'),
+        'oauth_redirect_uri' => env('MERCADO_PAGO_OAUTH_REDIRECT_URI'),
+        'oauth_frontend_redirect' => env('MERCADO_PAGO_OAUTH_FRONTEND_REDIRECT', env('APP_URL')),
+        'oauth_pkce_enabled' => env('MERCADO_PAGO_OAUTH_PKCE_ENABLED', false),
+        'oauth_auth_url_base' => env('MERCADO_PAGO_OAUTH_AUTH_URL_BASE', 'https://auth.mercadopago.com'),
+    ],
+
+    'openrouter' => [
+        // OpenAI-compatible chat completions API (https://openrouter.ai/docs).
+        'api_key' => env('OPENROUTER_API_KEY'),
+        'base_url' => rtrim(env('OPENROUTER_BASE_URL') ?: 'https://openrouter.ai/api/v1', '/'),
+        // Seconds before an OpenRouter request is aborted (the queued job then retries).
+        'timeout' => (int) (env('OPENROUTER_TIMEOUT') ?: 30),
+        // Queued LLM review of trip descriptions (contribution above the max, phone numbers).
+        'contribution_check' => [
+            'model' => env('OPENROUTER_CONTRIBUTION_CHECK_MODEL') ?: 'deepseek/deepseek-v4.1-flash',
+            // "off" disables reasoning; "low" (or another OpenRouter effort level) enables it.
+            'reasoning' => env('OPENROUTER_CONTRIBUTION_CHECK_REASONING') ?: 'off',
+        ],
+    ],
+
+    'whatsapp' => [
+        'verify_token' => env('WHATSAPP_VERIFY_TOKEN', 'your_verify_token_here'),
+        'app_secret' => env('WHATSAPP_APP_SECRET'),
+        'phone_number_id' => env('WHATSAPP_PHONE_NUMBER_ID'),
+        'access_token' => env('WHATSAPP_ACCESS_TOKEN'),
+    ],
+
+];

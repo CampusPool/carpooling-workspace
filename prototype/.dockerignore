@@ -1,0 +1,10 @@
+# Dependency directories
+vendor
+node_modules
+.vscode
+
+Dockerfile
+.dokerignore
+.gitignore
+.gitattributes
+.db

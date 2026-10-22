@@ -1,0 +1,771 @@
+<?php
+
+namespace Tests\Unit\Transformers;
+
+use Carbon\Carbon;
+use STS\Models\Car;
+use STS\Models\Passenger;
+use STS\Models\Trip;
+use STS\Models\User;
+use STS\Repository\FriendsRepository;
+use STS\Repository\FriendTripAlertRepository;
+use STS\Services\Logic\FriendsManager;
+use STS\Transformers\TripTransformer;
+use Tests\TestCase;
+
+class TripTransformerTest extends TestCase
+{
+    private function makeTrip(array $overrides = []): Trip
+    {
+        $owner = User::factory()->create();
+
+        return Trip::query()->create(array_merge([
+            'user_id' => $owner->id,
+            'from_town' => 'Rosario',
+            'to_town' => 'Cordoba',
+            'trip_date' => '2026-04-30 18:30:00',
+            'weekly_schedule' => 0,
+            'weekly_schedule_time' => null,
+            'description' => 'Intercity trip',
+            'total_seats' => 4,
+            'friendship_type_id' => Trip::PRIVACY_PUBLIC,
+            'distance' => 400,
+            'estimated_time' => '05:30',
+            'seat_price_cents' => 15000,
+            'recommended_trip_price_cents' => 16000,
+            'total_price' => 60000,
+            'state' => Trip::STATE_READY,
+            'is_passenger' => false,
+            'allow_kids' => true,
+            'allow_animals' => false,
+            'allow_smoking' => false,
+            'payment_id' => null,
+            'needs_sellado' => false,
+        ], $overrides));
+    }
+
+    public function test_transform_or_missing_returns_placeholder_when_trip_is_null(): void
+    {
+        $payload = (new TripTransformer(null))->transformOrMissing(null, 148201);
+
+        $this->assertSame(148201, $payload['id']);
+        $this->assertSame('Viaje inexistente', $payload['to_town']);
+        $this->assertTrue($payload['deleted']);
+    }
+
+    public function test_transform_returns_expected_base_trip_payload_without_user_context(): void
+    {
+        $trip = $this->makeTrip();
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame([
+            'id',
+            'from_town',
+            'to_town',
+            'punto_partida',
+            'punto_llegada',
+            'trip_date',
+            'weekly_schedule',
+            'weekly_schedule_time',
+            'description',
+            'total_seats',
+            'friendship_type_id',
+            'distance',
+            'estimated_time',
+            'seat_price_cents',
+            'recommended_trip_price_cents',
+            'pricing_breakdown',
+            'total_price',
+            'state',
+            'is_passenger',
+            'passenger_count',
+            'seats_available',
+            'points',
+            'ratings',
+            'updated_at',
+            'allow_kids',
+            'allow_animals',
+            'allow_smoking',
+            'rear_max_two_passengers',
+            'payment_id',
+            'needs_sellado',
+            'existing',
+            'sellado_pending',
+            'sellado_pending_label',
+            'request',
+            'passenger',
+        ], array_keys($payload));
+        $this->assertSame('Rosario', $payload['from_town']);
+        $this->assertSame('Cordoba', $payload['to_town']);
+        $this->assertSame('2026-04-30 18:30:00', $payload['trip_date']);
+        $this->assertEquals(400, $payload['distance']);
+        $this->assertSame(15000, $payload['seat_price_cents']);
+        $this->assertSame(false, $payload['sellado_pending']);
+        $this->assertIsBool($payload['sellado_pending']);
+        $this->assertSame(false, $payload['existing']);
+        $this->assertNull($payload['sellado_pending_label']);
+        $this->assertSame('', $payload['request']);
+        $this->assertSame([], $payload['passenger']);
+        $this->assertArrayNotHasKey('car', $payload);
+    }
+
+    public function test_transform_includes_pricing_breakdown_with_comfort_occupants(): void
+    {
+        config()->set('carpoolear.module_max_price_fuel_price', 1000);
+        config()->set('carpoolear.module_max_price_kilometer_by_liter', 10);
+        config()->set('carpoolear.module_max_price_price_variance_tolls', 10);
+        config()->set('carpoolear.module_trip_creation_payment_enabled', true);
+        config()->set('carpoolear.module_trip_creation_payment_amount_cents', 50);
+
+        $geo = \Mockery::mock(\STS\Services\GeoService::class);
+        $geo->shouldReceive('hasExactlyOneStopInCostaAtlanticaZone')->andReturn(false);
+        $this->app->instance(\STS\Services\GeoService::class, $geo);
+
+        $fiveOccupantsTrip = $this->makeTrip([
+            'distance' => 1000,
+            'rear_max_two_passengers' => 0,
+        ]);
+        $fivePayload = (new TripTransformer(null))->transform($fiveOccupantsTrip->fresh());
+
+        $this->assertSame(11050, $fivePayload['pricing_breakdown']['total_cents']);
+        $this->assertSame(5, $fivePayload['pricing_breakdown']['occupants']);
+        $this->assertSame(2210, $fivePayload['pricing_breakdown']['per_person_cents']);
+        $this->assertTrue($fivePayload['pricing_breakdown']['includes_sellado']);
+        $this->assertSame(50, $fivePayload['pricing_breakdown']['sellado_cents']);
+        $this->assertSame(10.0, $fivePayload['pricing_breakdown']['tolls_percent']);
+
+        $fourOccupantsTrip = $this->makeTrip([
+            'distance' => 1000,
+            'rear_max_two_passengers' => 1,
+        ]);
+        $fourPayload = (new TripTransformer(null))->transform($fourOccupantsTrip->fresh());
+
+        $this->assertSame(4, $fourPayload['pricing_breakdown']['occupants']);
+        $this->assertSame(2763, $fourPayload['pricing_breakdown']['per_person_cents']);
+    }
+
+    public function test_transform_pricing_breakdown_uses_costa_atlantica_tolls_when_in_zone(): void
+    {
+        config()->set('carpoolear.module_max_price_fuel_price', 1000);
+        config()->set('carpoolear.module_max_price_kilometer_by_liter', 10);
+        config()->set('carpoolear.module_max_price_price_variance_tolls', 10);
+        config()->set('carpoolear.module_max_price_price_variance_tolls_costa_atlantica', 25);
+        config()->set('carpoolear.module_trip_creation_payment_enabled', false);
+
+        $geo = \Mockery::mock(\STS\Services\GeoService::class);
+        $geo->shouldReceive('hasExactlyOneStopInCostaAtlanticaZone')->once()->andReturn(true);
+        $this->app->instance(\STS\Services\GeoService::class, $geo);
+
+        $trip = $this->makeTrip(['distance' => 100000]);
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame(25.0, $payload['pricing_breakdown']['tolls_percent']);
+        $this->assertSame(1250000, $payload['pricing_breakdown']['total_cents']);
+        $this->assertFalse($payload['pricing_breakdown']['includes_sellado']);
+    }
+
+    public function test_transform_sets_existing_true_when_trip_marked_as_existing(): void
+    {
+        $trip = $this->makeTrip();
+        $trip->setAttribute('existing', true);
+
+        $payload = (new TripTransformer(null))->transform($trip);
+
+        $this->assertTrue($payload['existing']);
+    }
+
+    public function test_transform_omits_car_for_unrelated_viewer_on_driver_trip(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $car = Car::factory()->create([
+            'user_id' => $owner->id,
+            'patente' => 'VIEW123',
+            'description' => 'Driver car',
+        ]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'car_id' => $car->id,
+            'is_passenger' => false,
+        ]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh(['car']));
+
+        $this->assertArrayNotHasKey('car', $payload);
+        $this->assertArrayNotHasKey('allPassengerRequest', $payload);
+    }
+
+    public function test_transform_omits_car_on_passenger_trip(): void
+    {
+        $owner = User::factory()->create();
+        $viewer = User::factory()->create();
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'is_passenger' => true,
+        ]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh());
+
+        $this->assertArrayNotHasKey('car', $payload);
+    }
+
+    public function test_transform_includes_rear_max_two_passengers(): void
+    {
+        $trip = $this->makeTrip(['rear_max_two_passengers' => true]);
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame(1, $payload['rear_max_two_passengers']);
+    }
+
+    public function test_transform_includes_punto_partida_and_punto_llegada(): void
+    {
+        $trip = $this->makeTrip([
+            'punto_partida' => 'Terminal de Ómnibus',
+            'punto_llegada' => 'Plaza Principal',
+        ]);
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame('Terminal de Ómnibus', $payload['punto_partida']);
+        $this->assertSame('Plaza Principal', $payload['punto_llegada']);
+    }
+
+    public function test_transform_marks_sellado_pending_when_needed_and_not_ready(): void
+    {
+        $trip = $this->makeTrip([
+            'needs_sellado' => true,
+            'state' => Trip::STATE_AWAITING_PAYMENT,
+        ]);
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame(true, $payload['sellado_pending']);
+        $this->assertIsBool($payload['sellado_pending']);
+        $this->assertSame('Falta pagar Sellado', $payload['sellado_pending_label']);
+    }
+
+    public function test_transform_requires_needs_sellado_and_non_ready_state_for_pending_flag(): void
+    {
+        $trip = $this->makeTrip([
+            'needs_sellado' => false,
+            'state' => Trip::STATE_AWAITING_PAYMENT,
+        ]);
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertSame(false, $payload['sellado_pending']);
+        $this->assertIsBool($payload['sellado_pending']);
+        $this->assertNull($payload['sellado_pending_label']);
+    }
+
+    public function test_transform_marks_hidden_or_deleted_based_on_deleted_at_value(): void
+    {
+        $hiddenTrip = $this->makeTrip();
+        $hiddenTrip->forceFill(['deleted_at' => Carbon::parse('2000-01-01 00:00:00')])->saveQuietly();
+        $hiddenPayload = (new TripTransformer(null))->transform($hiddenTrip->fresh());
+        $this->assertSame('2000-01-01 00:00:00', $hiddenPayload['deleted_at']);
+        $this->assertTrue($hiddenPayload['hidden']);
+        $this->assertArrayNotHasKey('deleted', $hiddenPayload);
+
+        $deletedTrip = $this->makeTrip();
+        $deletedTrip->forceFill(['deleted_at' => Carbon::parse('2026-05-01 12:00:00')])->saveQuietly();
+        $deletedPayload = (new TripTransformer(null))->transform($deletedTrip->fresh());
+        $this->assertSame('2026-05-01 12:00:00', $deletedPayload['deleted_at']);
+        $this->assertTrue($deletedPayload['deleted']);
+        $this->assertArrayNotHasKey('hidden', $deletedPayload);
+    }
+
+    public function test_transform_includes_catalog_names_on_car(): void
+    {
+        $owner = User::factory()->create(['is_admin' => true]);
+        $car = Car::factory()->withCatalog()->create([
+            'user_id' => $owner->id,
+            'patente' => 'CAT123',
+        ]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'car_id' => $car->id,
+        ]);
+
+        $payload = (new TripTransformer($owner))->transform($trip->fresh(['car']));
+
+        $this->assertNotEmpty($payload['car']['brand_name']);
+        $this->assertNotEmpty($payload['car']['model_name']);
+        $this->assertNotEmpty($payload['car']['color_name']);
+    }
+
+    public function test_transform_marks_soft_deleted_car_on_trip(): void
+    {
+        $owner = User::factory()->create(['is_admin' => true]);
+        $car = Car::factory()->withCatalog()->create([
+            'user_id' => $owner->id,
+            'patente' => 'DEL123',
+            'description' => 'Removed car',
+        ]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'car_id' => $car->id,
+        ]);
+        $car->delete();
+
+        $payload = (new TripTransformer($owner))->transform($trip->fresh(['car']));
+
+        $this->assertArrayHasKey('car', $payload);
+        $this->assertSame('DEL123', $payload['car']['patente']);
+        $this->assertTrue($payload['car']['deleted']);
+    }
+
+    public function test_transform_includes_owner_context_passenger_data_and_counts(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $acceptedUser = User::factory()->create();
+        $pendingUser = User::factory()->create();
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+        Passenger::query()->create([
+            'user_id' => $pendingUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($owner))->transform($trip->fresh());
+
+        $this->assertArrayHasKey('allPassengerRequest', $payload);
+        $this->assertArrayHasKey('request_count', $payload);
+        $this->assertArrayHasKey('passengerAccepted_count', $payload);
+        $this->assertArrayHasKey('passengerPending_count', $payload);
+        $this->assertCount(1, $payload['passenger']);
+        $this->assertSame($acceptedUser->id, $payload['passenger'][0]['id']);
+        $this->assertSame(2, $payload['request_count']);
+        $this->assertSame(1, $payload['passengerAccepted_count']);
+        $this->assertSame(1, $payload['passengerPending_count']);
+    }
+
+    public function test_transform_sets_request_send_for_pending_non_owner_user(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $requester = User::factory()->create(['is_admin' => false]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        Passenger::query()->create([
+            'user_id' => $requester->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($requester))->transform($trip->fresh());
+
+        $this->assertSame('send', $payload['request']);
+        $this->assertArrayNotHasKey('allPassengerRequest', $payload);
+        $this->assertSame(1, $payload['passengerPending_count']);
+    }
+
+    public function test_transform_sets_request_send_and_reduced_passengers_for_pending_viewer_with_copassengers(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $requester = User::factory()->create(['is_admin' => false]);
+        $acceptedUser = User::factory()->create(['name' => 'Carla Gómez']);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        Passenger::query()->create([
+            'user_id' => $requester->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($requester))->transform(
+            $trip->fresh(['user', 'passengerAccepted', 'passengerPending'])
+        );
+
+        $this->assertSame('send', $payload['request']);
+        $this->assertArrayNotHasKey('allPassengerRequest', $payload);
+        $this->assertCount(1, $payload['passenger']);
+        $this->assertSame(['id', 'image', 'first_name'], array_keys($payload['passenger'][0]));
+        $this->assertSame($acceptedUser->id, $payload['passenger'][0]['id']);
+        $this->assertSame('Carla', $payload['passenger'][0]['first_name']);
+    }
+
+    public function test_transform_owner_branch_matches_numeric_string_trip_user_id(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $acceptedUser = User::factory()->create();
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+
+        $trip = $trip->fresh(['user', 'passenger', 'passengerAccepted']);
+        $trip->mergeCasts(['user_id' => 'string']);
+        $trip->syncOriginal();
+        $trip->forceFill(['user_id' => (string) $owner->id]);
+        $trip->setRelation('user', $owner);
+
+        $payload = (new TripTransformer($owner))->transform($trip);
+
+        $this->assertArrayHasKey('allPassengerRequest', $payload);
+        $this->assertCount(1, $payload['passenger']);
+    }
+
+    public function test_transform_mutates_pending_passenger_rows_with_request_metadata(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $pendingUser = User::factory()->create(['name' => 'Pending Rider', 'email' => 'pending@example.test']);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        $pending = Passenger::query()->create([
+            'user_id' => $pendingUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($owner))->transform($trip->fresh());
+
+        $this->assertGreaterThan(0, $payload['request_count']);
+        $pendingRow = collect($payload['allPassengerRequest'])->firstWhere('id', $pendingUser->id);
+        $this->assertNotNull($pendingRow);
+        $this->assertSame($pending->id, $pendingRow->request_id);
+        $this->assertSame($pendingUser->id, $pendingRow->id);
+        $this->assertSame('Pending Rider', $pendingRow->name);
+        $this->assertSame('pending@example.test', $pendingRow->email);
+    }
+
+    public function test_transform_admin_with_pending_request_gets_send_flag_without_owner_inner_branch(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $admin = User::factory()->create(['is_admin' => true]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+
+        Passenger::query()->create([
+            'user_id' => $admin->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($admin))->transform($trip->fresh());
+
+        $this->assertSame('send', $payload['request']);
+        $this->assertArrayHasKey('allPassengerRequest', $payload);
+    }
+
+    public function test_transform_includes_driver_is_friend_when_viewer_is_friend(): void
+    {
+        $driver = User::factory()->create();
+        $viewer = User::factory()->create();
+        (new FriendsManager(new FriendsRepository, new FriendTripAlertRepository))->make($driver, $viewer);
+
+        $trip = $this->makeTrip(['user_id' => $driver->id]);
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh());
+
+        $this->assertTrue($payload['driver_is_friend']);
+    }
+
+    public function test_transform_includes_driver_is_friend_false_for_stranger(): void
+    {
+        $driver = User::factory()->create();
+        $viewer = User::factory()->create();
+        $trip = $this->makeTrip(['user_id' => $driver->id]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh());
+
+        $this->assertFalse($payload['driver_is_friend']);
+    }
+
+    public function test_transform_omits_driver_is_friend_without_logged_viewer(): void
+    {
+        $trip = $this->makeTrip();
+        $payload = (new TripTransformer(null))->transform($trip->fresh());
+
+        $this->assertArrayNotHasKey('driver_is_friend', $payload);
+    }
+
+    public function test_trip_includes_group_chat_unread_count_for_accepted_passenger(): void
+    {
+        $driver = User::factory()->create();
+        $passenger = User::factory()->create();
+        $trip = $this->makeTrip(['user_id' => $driver->id]);
+
+        $conversation = \STS\Models\Conversation::factory()->create([
+            'type' => \STS\Models\Conversation::TYPE_TRIP_CONVERSATION,
+            'trip_id' => $trip->id,
+        ]);
+        $conversation->users()->attach($driver->id, ['read' => true, 'notifications_enabled' => true]);
+        $conversation->users()->attach($passenger->id, ['read' => true, 'notifications_enabled' => true]);
+
+        Passenger::factory()->create([
+            'trip_id' => $trip->id,
+            'user_id' => $passenger->id,
+            'request_state' => Passenger::STATE_ACCEPTED,
+        ]);
+
+        $msgOne = \STS\Models\Message::query()->create([
+            'user_id' => $driver->id,
+            'conversation_id' => $conversation->id,
+            'text' => 'One',
+            'estado' => \STS\Models\Message::STATE_NOLEIDO,
+        ]);
+        $msgTwo = \STS\Models\Message::query()->create([
+            'user_id' => $driver->id,
+            'conversation_id' => $conversation->id,
+            'text' => 'Two',
+            'estado' => \STS\Models\Message::STATE_NOLEIDO,
+        ]);
+        $msgOne->users()->attach($passenger->id, ['read' => false]);
+        $msgTwo->users()->attach($passenger->id, ['read' => false]);
+
+        $trip = $trip->fresh(['passenger', 'passengerAccepted']);
+        $payload = (new TripTransformer($passenger))->transform($trip);
+
+        $this->assertSame($conversation->id, $payload['group_chat_conversation_id']);
+        $this->assertSame(2, $payload['group_chat_unread_count']);
+    }
+
+    public function test_trip_includes_group_chat_for_passenger_waiting_payment_not_yet_in_conversation(): void
+    {
+        $driver = User::factory()->create();
+        $passenger = User::factory()->create();
+        $trip = $this->makeTrip(['user_id' => $driver->id]);
+
+        $conversation = \STS\Models\Conversation::factory()->create([
+            'type' => \STS\Models\Conversation::TYPE_TRIP_CONVERSATION,
+            'trip_id' => $trip->id,
+        ]);
+        $conversation->users()->attach($driver->id, ['read' => true, 'notifications_enabled' => true]);
+
+        Passenger::factory()->create([
+            'trip_id' => $trip->id,
+            'user_id' => $passenger->id,
+            'request_state' => Passenger::STATE_WAITING_PAYMENT,
+        ]);
+
+        $trip = $trip->fresh(['passenger', 'passengerAccepted']);
+        $payload = (new TripTransformer($passenger))->transform($trip);
+
+        $this->assertSame($conversation->id, $payload['group_chat_conversation_id']);
+        $this->assertTrue($conversation->fresh()->users()->whereKey($passenger->id)->exists());
+    }
+
+    public function test_transform_exposes_seat_request_limit_not_reached_when_module_on_and_under_limit(): void
+    {
+        \Illuminate\Support\Facades\Config::set('carpoolear.module_unaswered_message_limit', true);
+        $owner = User::factory()->create([
+            'is_admin' => false,
+            'unaswered_messages_limit' => 3,
+        ]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $trip = $this->makeTrip(['user_id' => $owner->id, 'state' => Trip::STATE_READY]);
+
+        Passenger::query()->create([
+            'user_id' => User::factory()->create()->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh(['user', 'passengerPending']));
+
+        $this->assertSame(3, $payload['seat_request_limit']);
+        $this->assertFalse($payload['seat_request_limit_reached']);
+    }
+
+    public function test_transform_exposes_seat_request_limit_reached_when_pending_count_meets_limit(): void
+    {
+        \Illuminate\Support\Facades\Config::set('carpoolear.module_unaswered_message_limit', true);
+        $owner = User::factory()->create([
+            'is_admin' => false,
+            'unaswered_messages_limit' => 1,
+        ]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $trip = $this->makeTrip(['user_id' => $owner->id, 'state' => Trip::STATE_READY]);
+
+        Passenger::query()->create([
+            'user_id' => User::factory()->create()->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_PENDING,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh(['user', 'passengerPending']));
+
+        $this->assertSame(1, $payload['seat_request_limit']);
+        $this->assertTrue($payload['seat_request_limit_reached']);
+    }
+
+    public function test_transform_seat_request_limit_not_reached_when_only_empty_trip_group_chat_exists(): void
+    {
+        \Illuminate\Support\Facades\Config::set('carpoolear.module_unaswered_message_limit', true);
+        $owner = User::factory()->create([
+            'is_admin' => false,
+            'unaswered_messages_limit' => 1,
+        ]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $trip = $this->makeTrip(['user_id' => $owner->id, 'state' => Trip::STATE_READY]);
+        $groupChat = \STS\Models\Conversation::factory()->create([
+            'trip_id' => $trip->id,
+            'type' => \STS\Models\Conversation::TYPE_TRIP_CONVERSATION,
+        ]);
+        $groupChat->users()->attach($owner->id, ['read' => true, 'notifications_enabled' => true]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh(['user', 'passengerPending']));
+
+        $this->assertSame(1, $payload['seat_request_limit']);
+        $this->assertFalse($payload['seat_request_limit_reached']);
+    }
+
+    public function test_transform_seat_request_limit_null_when_module_disabled(): void
+    {
+        \Illuminate\Support\Facades\Config::set('carpoolear.module_unaswered_message_limit', false);
+        $owner = User::factory()->create([
+            'is_admin' => false,
+            'unaswered_messages_limit' => 2,
+        ]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $trip = $this->makeTrip(['user_id' => $owner->id, 'state' => Trip::STATE_READY]);
+
+        $payload = (new TripTransformer($viewer))->transform($trip->fresh(['user']));
+
+        $this->assertNull($payload['seat_request_limit']);
+        $this->assertFalse($payload['seat_request_limit_reached']);
+    }
+
+    public function test_transform_omits_seat_request_limit_fields_without_viewer(): void
+    {
+        \Illuminate\Support\Facades\Config::set('carpoolear.module_unaswered_message_limit', true);
+        $trip = $this->makeTrip();
+
+        $payload = (new TripTransformer(null))->transform($trip->fresh(['user']));
+
+        $this->assertArrayNotHasKey('seat_request_limit', $payload);
+        $this->assertArrayNotHasKey('seat_request_limit_reached', $payload);
+    }
+
+    public function test_transform_includes_first_name_on_owner_passenger(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $acceptedUser = User::factory()->create(['name' => 'Lucía Fernández']);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($owner))->transform($trip->fresh(['passengerAccepted']));
+
+        $this->assertSame('Lucía', $payload['passenger'][0]['first_name']);
+        $this->assertSame('Lucía Fernández', $payload['passenger'][0]['name']);
+    }
+
+    public function test_transform_exposes_reduced_passengers_to_unrelated_viewer(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $viewer = User::factory()->create(['is_admin' => false]);
+        $acceptedUser = User::factory()->create([
+            'name' => 'Diego Ruiz',
+            'image' => 'diego.png',
+        ]);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($viewer))->transform(
+            $trip->fresh(['user', 'passengerAccepted', 'passengerPending'])
+        );
+
+        $this->assertArrayNotHasKey('allPassengerRequest', $payload);
+        $this->assertCount(1, $payload['passenger']);
+        $this->assertSame(['id', 'image', 'first_name'], array_keys($payload['passenger'][0]));
+        $this->assertSame($acceptedUser->id, $payload['passenger'][0]['id']);
+        $this->assertSame('Diego', $payload['passenger'][0]['first_name']);
+        $this->assertArrayNotHasKey('name', $payload['passenger'][0]);
+    }
+
+    public function test_transform_includes_full_passengers_for_admin(): void
+    {
+        $owner = User::factory()->create(['is_admin' => false]);
+        $admin = User::factory()->create(['is_admin' => true]);
+        $acceptedUser = User::factory()->create(['name' => 'Sofía Díaz']);
+        $trip = $this->makeTrip([
+            'user_id' => $owner->id,
+            'state' => Trip::STATE_READY,
+        ]);
+        Passenger::query()->create([
+            'user_id' => $acceptedUser->id,
+            'trip_id' => $trip->id,
+            'passenger_type' => Passenger::TYPE_PASAJERO,
+            'request_state' => Passenger::STATE_ACCEPTED,
+            'canceled_state' => null,
+        ]);
+
+        $payload = (new TripTransformer($admin))->transform(
+            $trip->fresh(['passengerAccepted', 'passenger'])
+        );
+
+        $this->assertCount(1, $payload['passenger']);
+        $this->assertSame('Sofía Díaz', $payload['passenger'][0]['name']);
+        $this->assertSame('Sofía', $payload['passenger'][0]['first_name']);
+    }
+}

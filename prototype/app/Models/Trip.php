@@ -1,0 +1,397 @@
+<?php
+
+namespace STS\Models;
+
+use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
+
+/*************************************************
+ *  Clase Trip:
+ *
+ *             ->  es_pasajero se llama is_passenger
+ *             ->  esta_carpooleado y el contador de pasajero no existen más
+ *             ->  activo dejo de funcionar
+ *
+ *************************************************/
+
+class Trip extends Model
+{
+    use HasFactory, SoftDeletes;
+
+    protected static function newFactory()
+    {
+        return \Database\Factories\TripFactory::new();
+    }
+
+    const FINALIZADO = 0; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const ACTIVO = 1; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const PRIVACY_PUBLIC = 2; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const PRIVACY_FRIENDS = 0; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const PRIVACY_FOF = 1; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const STATE_AWAITING_PAYMENT = 'awaiting_payment';
+
+    const STATE_PENDING_PAYMENT = 'pending_payment';
+
+    const STATE_PAID = 'paid';
+
+    const STATE_PAYMENT_FAILED = 'payment_failed';
+
+    const STATE_READY = 'ready';
+
+    const STATE_CANCELED = 'canceled';
+
+    // Weekly schedule bitmask constants
+    const DAY_MONDAY = 1; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_TUESDAY = 2; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_WEDNESDAY = 4; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_THURSDAY = 8; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_FRIDAY = 16; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_SATURDAY = 32; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    const DAY_SUNDAY = 64; // @pest-mutate-ignore:DecrementInteger,IncrementInteger
+
+    protected $table = 'trips';
+
+    /**
+     * @return list<string>
+     */
+    public function getFillable(): array
+    {
+        return [
+            'user_id',
+            'from_town',
+            'to_town',
+            'punto_partida',
+            'punto_llegada',
+            'trip_date',
+            'weekly_schedule',
+            'weekly_schedule_time',
+            'description',
+            'total_seats',
+            'friendship_type_id',
+            'distance',
+            'seat_price_cents',
+            'recommended_trip_price_cents',
+            'total_price',
+            'estimated_time',
+            'co2',
+            'es_recurrente',
+            'is_passenger',
+            'mail_send',
+            'return_trip_id',
+            'enc_path',
+            'car_id',
+            'parent_trip_id',
+            'allow_smoking',
+            'allow_kids',
+            'allow_animals',
+            'rear_max_two_passengers',
+            'state',
+            'payment_id',
+            'needs_sellado',
+            'autoaccept_friends_requests',
+            'has_potential_excess_contribution',
+            'description_potential_seat_price_cents',
+            'average_contribution_cents',
+            'excess_contribution_percentage',
+            'exceso_contribucion_status',
+            'suspected_contribution',
+            'phone_in_description',
+            'maximum_trip_price_cents',
+        ];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getHidden(): array
+    {
+        return [
+            'enc_path',
+        ];
+    }
+
+    public function getAppends(): array
+    {
+        return [
+            'passenger_count',
+            'seats_available',
+            'is_driver',
+        ];
+    }
+
+    public function hasAppended($attribute): bool
+    {
+        return in_array($attribute, $this->getAppends(), true);
+    }
+
+    protected function getArrayableAppends()
+    {
+        $appends = $this->getAppends();
+
+        $keys = count($appends) === 0
+            ? []
+            : array_combine($appends, $appends);
+
+        return $this->getArrayableItems($keys);
+    }
+
+    protected function casts(): array
+    {
+        return [
+            'es_recurrente' => 'boolean',
+            'weekly_schedule' => 'integer',
+            'weekly_schedule_time' => 'datetime',
+            'is_passenger' => 'boolean',
+            'trip_date' => 'datetime',
+            'trips_count_credited_at' => 'datetime',
+            'sellado_empty_trip_credit_redeemed_at' => 'datetime',
+            'created_at' => 'datetime',
+            'deleted_at' => 'datetime',
+            'seat_price_cents' => 'integer',
+            'recommended_trip_price_cents' => 'integer',
+            'description_potential_seat_price_cents' => 'integer',
+            'average_contribution_cents' => 'integer',
+            'excess_contribution_percentage' => 'integer',
+            'has_potential_excess_contribution' => 'boolean',
+            'exceso_contribucion_status' => 'string',
+            'suspected_contribution' => 'float',
+            'phone_in_description' => 'boolean',
+            'maximum_trip_price_cents' => 'integer',
+            'state' => 'string',
+        ];
+    }
+
+    public function parentTrip()
+    {
+        return $this->hasOne('STS\Models\Trip', 'parent_trip_id');
+    }
+
+    public function user()
+    {
+        return $this->belongsTo('STS\Models\User', 'user_id');
+    }
+
+    public function userVisibility()
+    {
+        return $this->hasMany('STS\Models\TripVisibility', 'trip_id');
+    }
+
+    public function car()
+    {
+        return $this->belongsTo('STS\Models\Car', 'car_id')->withTrashed();
+    }
+
+    public function passenger()
+    {
+        return $this->hasMany('STS\Models\Passenger', 'trip_id')->with('user');
+    }
+
+    public function routes()
+    {
+        return $this->belongsToMany('STS\Models\Route', 'trip_routes', 'trip_id', 'route_id');
+    }
+
+    public function passengerAccepted()
+    {
+        return $this->passenger()->whereRequestState(Passenger::STATE_ACCEPTED)->where('user_id', '<>', $this->user_id);
+    }
+
+    public function passengerPending()
+    {
+        return $this->passenger()->whereIn('request_state', [
+            Passenger::STATE_PENDING,
+            Passenger::STATE_WAITING_PAYMENT,
+        ]);
+    }
+
+    public function days()
+    {
+        return $this->hasMany('STS\Models\TripDay', 'trip_id');
+    }
+
+    public function points()
+    {
+        return $this->hasMany('STS\Models\TripPoint', 'trip_id');
+    }
+
+    public function liveShares()
+    {
+        return $this->hasMany(TripLiveShare::class, 'trip_id');
+    }
+
+    public function ratings()
+    {
+        return $this->hasMany('STS\Models\Rating', 'trip_id')->with(['from', 'to']);
+    }
+
+    public function outbound()
+    {
+        return $this->hasOne('STS\Models\Trip', 'return_trip_id');
+    }
+
+    public function inbound()
+    {
+        return $this->belongsTo('STS\Models\Trip', 'return_trip_id');
+    }
+
+    public function conversation()
+    {
+        return $this->hasOne('STS\Models\Conversation', 'trip_id')
+            ->where('type', Conversation::TYPE_TRIP_CONVERSATION);
+    }
+
+    public function payments()
+    {
+        return $this->hasMany('STS\Models\Payment', 'trip_id');
+    }
+
+    public function getPassengerCountAttribute()
+    {
+        return $this->passengerAccepted()->count();
+    }
+
+    public function isPending($user)
+    {
+        return $this->passengerPending()->where('user_id', $user->id)->count() > 0;
+    }
+
+    public function isPassenger($user)
+    {
+        return $this->passengerAccepted->where('user_id', $user->id)->count() > 0;
+    }
+
+    public function canAccessGroupChat($user)
+    {
+        if ((int) $this->user_id === (int) $user->id) {
+            return true;
+        }
+
+        return $this->passenger()
+            ->where('user_id', $user->id)
+            ->whereIn('request_state', [
+                Passenger::STATE_ACCEPTED,
+                Passenger::STATE_WAITING_PAYMENT,
+            ])
+            ->exists();
+    }
+
+    public function getSeatsAvailableAttribute()
+    {
+        return $this->total_seats - $this->passengerAccepted()->count();
+    }
+
+    public function getIsDriverAttribute()
+    {
+        return ! $this->is_passenger;
+    }
+
+    public function setDescriptionAttribute($value)
+    {
+        $this->attributes['description'] = $value; // htmlentities($value);
+    }
+
+    public function isAwaitingPayment()
+    {
+        return $this->state === self::STATE_AWAITING_PAYMENT;
+    }
+
+    public function isPaymentFailed()
+    {
+        return $this->state === self::STATE_PAYMENT_FAILED;
+    }
+
+    public function isReady()
+    {
+        return $this->state === self::STATE_READY;
+    }
+
+    public function isCanceled()
+    {
+        return $this->state === self::STATE_CANCELED;
+    }
+
+    public function setStateAwaitingPayment()
+    {
+        $this->state = self::STATE_AWAITING_PAYMENT;
+
+        return $this;
+    }
+
+    public function setStatePaymentFailed()
+    {
+        $this->state = self::STATE_PAYMENT_FAILED;
+
+        return $this;
+    }
+
+    public function setStateReady()
+    {
+        $this->state = self::STATE_READY;
+
+        return $this;
+    }
+
+    public function setStateCanceled()
+    {
+        $this->state = self::STATE_CANCELED;
+
+        return $this;
+    }
+
+    public function expired()
+    {
+        // Weekly schedule trips never expire
+        if ($this->weekly_schedule > 0) {
+            return false;
+        }
+        // Handle nullable trip_date for weekly schedule trips
+        if ($this->trip_date === null) {
+            return false;
+        }
+
+        return $this->trip_date->lt(Carbon::now());
+    }
+
+    public function checkFriendship($user)
+    {
+        $conductor = $this->user;
+        $fiends = $conductor->friends()->whereId($user->id)->first();
+        $fof = $conductor->relativeFriends()->where('id', $user->id)->first();
+
+        if ($conductor->id == $user->id) {
+            return true;
+        }
+
+        switch ($this->friendship_type_id) {
+            case self::PRIVACY_PUBLIC:
+                return true;
+            case self::PRIVACY_FRIENDS:
+                return ! is_null($fiends);
+            case self::PRIVACY_FOF:
+                return ! is_null($fiends) || ! is_null($fof);
+        }
+    }
+
+    // public function getSeatPriceAttribute()
+    // {
+    //     return $this->seat_price_cents / 100;
+    // }
+
+    // public function setSeatPriceAttribute($value)
+    // {
+    //     $this->attributes['seat_price_cents'] = round($value * 100);
+    // }
+}

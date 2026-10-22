@@ -1,0 +1,185 @@
+<?php
+
+namespace Tests\Unit\Transformers;
+
+use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
+use STS\Models\Rating;
+use STS\Models\Trip;
+use STS\Models\User;
+use STS\Transformers\RatingTransformer;
+use Tests\TestCase;
+
+class RatingTransformerTest extends TestCase
+{
+    public function test_transform_includes_expected_payload_keys_when_rate_is_pending(): void
+    {
+        $from = User::factory()->create();
+        $to = User::factory()->create();
+        $trip = Trip::factory()->create(['user_id' => $to->id]);
+
+        $rate = Rating::query()->create([
+            'trip_id' => $trip->id,
+            'user_id_from' => $from->id,
+            'user_id_to' => $to->id,
+            'rating' => Rating::STATE_POSITIVO,
+            'comment' => 'Great trip',
+            'reply_comment' => 'Thanks!',
+            'reply_comment_created_at' => '2026-04-29 08:00:00',
+            'user_to_type' => 1,
+            'user_to_state' => 1,
+            'voted' => true,
+            'voted_hash' => '',
+            'rate_at' => null,
+        ]);
+
+        $payload = (new RatingTransformer($from))->transform($rate->fresh());
+
+        $this->assertSame([
+            'id',
+            'from',
+            'trip',
+            'comment',
+            'user_to_state',
+            'user_to_type',
+            'rate_at',
+            'reply_comment',
+            'reply_comment_created_at',
+            'rating',
+            'to',
+        ], array_keys($payload));
+        $this->assertSame($rate->id, $payload['id']);
+        $this->assertSame('Great trip', $payload['comment']);
+        $this->assertSame($trip->id, $payload['trip']['id']);
+        $this->assertNull($payload['rate_at']);
+        $this->assertSame('2026-04-29 08:00:00', $payload['reply_comment_created_at']);
+        $this->assertSame($to->id, $payload['to']['id']);
+    }
+
+    public function test_transform_omits_to_when_rate_at_exists_and_formats_dates(): void
+    {
+        $from = User::factory()->create();
+        $to = User::factory()->create();
+        $trip = Trip::factory()->create(['user_id' => $to->id]);
+
+        $rate = Rating::query()->create([
+            'trip_id' => $trip->id,
+            'user_id_from' => $from->id,
+            'user_id_to' => $to->id,
+            'rating' => Rating::STATE_NEGATIVO,
+            'comment' => 'Late arrival',
+            'reply_comment' => '',
+            'reply_comment_created_at' => null,
+            'user_to_type' => 0,
+            'user_to_state' => 0,
+            'voted' => true,
+            'voted_hash' => '',
+            'rate_at' => Carbon::parse('2026-04-30 11:00:00'),
+        ]);
+
+        $payload = (new RatingTransformer($from))->transform($rate->fresh());
+
+        $this->assertArrayNotHasKey('to', $payload);
+        $this->assertSame('2026-04-30 11:00:00', $payload['rate_at']);
+        $this->assertNull($payload['reply_comment_created_at']);
+        $this->assertSame(Rating::STATE_NEGATIVO, $payload['rating']);
+    }
+
+    public function test_transform_returns_placeholder_when_from_user_was_deleted(): void
+    {
+        $from = User::factory()->create();
+        $to = User::factory()->create();
+        $trip = Trip::factory()->create(['user_id' => $to->id]);
+        $deletedFromId = $from->id;
+
+        $rate = Rating::query()->create([
+            'trip_id' => $trip->id,
+            'user_id_from' => $deletedFromId,
+            'user_id_to' => $to->id,
+            'rating' => Rating::STATE_POSITIVO,
+            'comment' => 'From deleted user',
+            'reply_comment' => '',
+            'reply_comment_created_at' => null,
+            'user_to_type' => 1,
+            'user_to_state' => 1,
+            'voted' => true,
+            'voted_hash' => '',
+            'rate_at' => Carbon::parse('2026-04-30 11:00:00'),
+        ]);
+
+        DB::statement('SET FOREIGN_KEY_CHECKS=0');
+        $from->delete();
+        DB::statement('SET FOREIGN_KEY_CHECKS=1');
+
+        $payload = (new RatingTransformer($to))->transform($rate->fresh());
+
+        $this->assertSame($deletedFromId, $payload['from']['id']);
+        $this->assertSame('Usuario ya no existe', $payload['from']['name']);
+        $this->assertSame('', $payload['from']['image']);
+    }
+
+    public function test_transform_returns_placeholder_when_to_user_was_deleted_on_pending_rate(): void
+    {
+        $from = User::factory()->create();
+        $to = User::factory()->create();
+        $trip = Trip::factory()->create(['user_id' => $from->id]);
+        $deletedToId = $to->id;
+
+        $rate = Rating::query()->create([
+            'trip_id' => $trip->id,
+            'user_id_from' => $from->id,
+            'user_id_to' => $deletedToId,
+            'rating' => Rating::STATE_POSITIVO,
+            'comment' => 'Pending rate',
+            'reply_comment' => '',
+            'reply_comment_created_at' => null,
+            'user_to_type' => 1,
+            'user_to_state' => 1,
+            'voted' => true,
+            'voted_hash' => '',
+            'rate_at' => null,
+        ]);
+
+        DB::statement('SET FOREIGN_KEY_CHECKS=0');
+        $to->delete();
+        DB::statement('SET FOREIGN_KEY_CHECKS=1');
+
+        $payload = (new RatingTransformer($from))->transform($rate->fresh());
+
+        $this->assertSame($deletedToId, $payload['to']['id']);
+        $this->assertSame('Usuario ya no existe', $payload['to']['name']);
+    }
+
+    public function test_transform_returns_placeholder_when_trip_was_deleted(): void
+    {
+        $from = User::factory()->create();
+        $to = User::factory()->create();
+        $trip = Trip::factory()->create(['user_id' => $to->id]);
+        $deletedTripId = $trip->id;
+
+        $rate = Rating::query()->create([
+            'trip_id' => $deletedTripId,
+            'user_id_from' => $from->id,
+            'user_id_to' => $to->id,
+            'rating' => Rating::STATE_POSITIVO,
+            'comment' => 'Trip deleted',
+            'reply_comment' => '',
+            'reply_comment_created_at' => null,
+            'user_to_type' => 1,
+            'user_to_state' => 1,
+            'voted' => true,
+            'voted_hash' => '',
+            'rate_at' => Carbon::parse('2026-04-30 11:00:00'),
+        ]);
+
+        DB::statement('SET FOREIGN_KEY_CHECKS=0');
+        $trip->forceDelete();
+        DB::statement('SET FOREIGN_KEY_CHECKS=1');
+
+        $payload = (new RatingTransformer($to))->transform($rate->fresh());
+
+        $this->assertSame($deletedTripId, $payload['trip']['id']);
+        $this->assertSame('Viaje inexistente', $payload['trip']['to_town']);
+        $this->assertTrue($payload['trip']['deleted']);
+    }
+}

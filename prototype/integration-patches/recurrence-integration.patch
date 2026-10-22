@@ -1,0 +1,13 @@
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -1124,6 +1124,10 @@
+     {
+         return Trip::where('user_id', $userId)
+             ->where('created_at', '>=', Carbon::now()->subHours($hours))
++            ->whereNotExists(function ($query) {
++                $query->selectRaw('1')->from('mobility_recurring_occurrences')
++                    ->whereColumn('mobility_recurring_occurrences.trip_id', 'trips.id');
++            })
+             ->get();
+     }
+ 

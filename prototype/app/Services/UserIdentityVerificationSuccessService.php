@@ -1,0 +1,73 @@
+<?php
+
+namespace STS\Services;
+
+use STS\Models\ManualIdentityValidation;
+use STS\Models\MercadoPagoRejectedValidation;
+use STS\Models\User;
+
+class UserIdentityVerificationSuccessService
+{
+    public function applyVerification(User $user, string $validationType, array $options = []): void
+    {
+        $this->clearPriorRejectionState($user, $options);
+
+        $user->identity_validated = true;
+        $user->identity_validated_at = now();
+        $user->identity_validation_type = $validationType;
+        $user->identity_validation_rejected_at = null;
+        $user->identity_validation_reject_reason = null;
+        $user->save();
+
+        if ($validationType === 'mercado_pago') {
+            $this->closeOpenManualIdentityValidationsForUser($user);
+        }
+    }
+
+    private function closeOpenManualIdentityValidationsForUser(User $user): void
+    {
+        $open = ManualIdentityValidation::query()
+            ->where('user_id', $user->id)
+            ->where(function ($query) {
+                $query->whereNull('review_status')
+                    ->orWhereNotIn('review_status', ManualIdentityValidation::resolvedReviewStatusAliases());
+            })
+            ->get();
+
+        $outcome = app(IdentityVerificationOutcome::class);
+        foreach ($open as $item) {
+            $item->review_status = ManualIdentityValidation::REVIEW_STATUS_CLOSED;
+            $item->save();
+            $outcome->emit([
+                'user_id' => $user->id,
+                'method' => IdentityVerificationOutcome::METHOD_MANUAL,
+                'name' => IdentityVerificationOutcome::NAME_CLOSED_AFTER_MP_SUCCESS,
+                'related_type' => 'manual_identity_validations',
+                'related_id' => $item->id,
+            ]);
+        }
+    }
+
+    public function clearPriorRejectionState(User $user, array $options = []): void
+    {
+        $preserveMpRejectedIds = $options['preserve_mercado_pago_rejected_validation_ids'] ?? [];
+
+        $mpRejectedQuery = MercadoPagoRejectedValidation::query()->where('user_id', $user->id);
+        if ($preserveMpRejectedIds !== []) {
+            $mpRejectedQuery->whereNotIn('id', $preserveMpRejectedIds);
+        }
+        $mpRejectedQuery->delete();
+
+        $this->deleteRejectedManualIdentityValidationsForUser($user);
+    }
+
+    private function deleteRejectedManualIdentityValidationsForUser(User $user): void
+    {
+        $records = ManualIdentityValidation::query()
+            ->where('user_id', $user->id)
+            ->where('review_status', ManualIdentityValidation::REVIEW_STATUS_REJECTED)
+            ->get();
+
+        ManualIdentityValidationDeletion::deleteRecords($records);
+    }
+}

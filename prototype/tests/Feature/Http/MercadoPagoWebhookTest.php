@@ -1,0 +1,976 @@
+<?php
+
+namespace Tests\Feature\Http;
+
+use Database\Seeders\DonationTierSeeder;
+use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use MercadoPago\MercadoPagoConfig;
+use MercadoPago\Net\MPDefaultHttpClient;
+use MercadoPago\Net\MPHttpClient;
+use MercadoPago\Net\MPRequest;
+use MercadoPago\Net\MPResponse;
+use STS\Models\DonationPayment;
+use STS\Models\DonationSubscription;
+use STS\Models\DonationTier;
+use STS\Models\ManualIdentityValidation;
+use STS\Models\PaymentAttempt;
+use STS\Models\Trip;
+use STS\Models\User;
+use Tests\TestCase;
+
+class MercadoPagoWebhookTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        MercadoPagoConfig::setHttpClient(new MPDefaultHttpClient);
+        parent::tearDown();
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $paymentIdToPayload
+     */
+    private function stubMercadoPagoPayments(array $paymentIdToPayload): void
+    {
+        MercadoPagoConfig::setAccessToken('test-access-token');
+        MercadoPagoConfig::setHttpClient(new class($paymentIdToPayload) implements MPHttpClient
+        {
+            public function __construct(private array $paymentIdToPayload) {}
+
+            public function send(MPRequest $request): MPResponse
+            {
+                $uri = $request->getUri();
+                if (! preg_match('#/v1/payments/(\d+)#', $uri, $matches)) {
+                    return new MPResponse(404, ['message' => 'unexpected uri']);
+                }
+
+                $id = (int) $matches[1];
+                if (! array_key_exists($id, $this->paymentIdToPayload)) {
+                    throw new \RuntimeException('Mercado Pago payment not found');
+                }
+
+                $payload = $this->paymentIdToPayload[$id];
+                if (isset($payload['__simulate_fetch_error'])) {
+                    throw new \Exception('Simulated Mercado Pago payment fetch failure');
+                }
+
+                return new MPResponse(200, $payload);
+            }
+        });
+    }
+
+    /**
+     * Hashed format required when the decoded reference contains `:` (see `parseExternalReference`).
+     */
+    private function hashedSelladoExternalReference(int $tripId): string
+    {
+        $referenceString = 'Sellado de Viaje ID: '.$tripId;
+        $salt = config('services.mercadopago.reference_salt', 'carpoolear_2024_secure_salt');
+        $hash = hash('sha256', $referenceString.$salt);
+
+        return $hash.':'.base64_encode($referenceString);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    /**
+     * @param  array<string, mixed>  $overrides
+     * @return array<string, mixed>
+     */
+    private function mercadoPagoPaymentPayload(string $externalReference, int $id, array $overrides = []): array
+    {
+        return array_merge([
+            'id' => $id,
+            'status' => 'approved',
+            'status_detail' => 'accredited',
+            'transaction_amount' => 150.0,
+            'currency_id' => 'ARS',
+            'payment_method_id' => 'visa',
+            'payment_type_id' => 'credit_card',
+            'external_reference' => $externalReference,
+            'description' => 'Test payment',
+            'date_created' => '2026-01-01T00:00:00.000-00:00',
+            'date_approved' => '2026-01-01T00:00:01.000-00:00',
+            'date_last_updated' => '2026-01-01T00:00:02.000-00:00',
+        ], $overrides);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function paymentCreatedSignatureHeaders(string $queryDataId, string $requestId, string $secret): array
+    {
+        $ts = (string) time();
+        $manifest = "id:{$queryDataId};request-id:{$requestId};ts:{$ts};";
+        $v1 = hash_hmac('sha256', $manifest, $secret);
+
+        return [
+            'x-request-id' => $requestId,
+            'x-signature' => "ts={$ts},v1={$v1}",
+        ];
+    }
+
+    /**
+     * PHP's parse_str rewrites `data.id` to `data_id`. Production still signs the dotted query
+     * key, so keep it as a literal ParameterBag entry the way some SAPIs expose it.
+     *
+     * @param  array<string, string>  $query
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, string>  $headers
+     */
+    private function postMercadoPagoWebhookPreservingDottedDataIdQuery(
+        string $dataId,
+        array $query,
+        array $payload,
+        array $headers
+    ): \Symfony\Component\HttpFoundation\Response {
+        $request = Request::create(
+            '/webhooks/mercadopago',
+            'POST',
+            $payload,
+            [],
+            [],
+            [
+                'HTTP_ACCEPT' => 'application/json',
+                'HTTP_X_REQUEST_ID' => $headers['x-request-id'],
+                'HTTP_X_SIGNATURE' => $headers['x-signature'],
+            ]
+        );
+        $request->headers->set('x-request-id', $headers['x-request-id']);
+        $request->headers->set('x-signature', $headers['x-signature']);
+        $request->query->replace(array_merge($query, ['data.id' => $dataId]));
+
+        return $this->app->make(Kernel::class)->handle($request);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function orderProcessedSignatureHeaders(string $orderIdForQuery, string $requestId, string $secret): array
+    {
+        $dataId = strtolower($orderIdForQuery);
+        $ts = (string) time();
+        $manifest = "id:{$dataId};request-id:{$requestId};ts:{$ts};";
+        $v1 = hash_hmac('sha256', $manifest, $secret);
+
+        return [
+            'x-request-id' => $requestId,
+            'x-signature' => "ts={$ts},v1={$v1}",
+        ];
+    }
+
+    public function test_non_payment_webhook_actions_are_acknowledged_without_side_effects(): void
+    {
+        $this->postJson('/webhooks/mercadopago', [
+            'action' => 'payment.updated',
+        ])
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+    }
+
+    public function test_incoming_mercadopago_webhook_is_logged_at_info_without_secrets(): void
+    {
+        Log::spy();
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data.id' => 'pay-log-1',
+            'type' => 'payment',
+        ]), [
+            'action' => 'merchant_order',
+            'type' => 'payment',
+        ])
+            ->assertOk();
+
+        Log::shouldHaveReceived('info')->withArgs(function (string $message, array $context): bool {
+            $hasSecret = collect($context)->contains(function ($value) {
+                return is_string($value) && str_contains(strtolower($value), 'secret');
+            });
+
+            return str_contains($message, 'MercadoPago webhook received')
+                && ($context['type'] ?? null) === 'payment'
+                && ($context['action'] ?? null) === 'merchant_order'
+                && ($context['data.id'] ?? null) === 'pay-log-1'
+                && ! $hasSecret;
+        });
+    }
+
+    public function test_payment_created_without_verification_headers_is_rejected(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $this->postJson('/webhooks/mercadopago?data_id=123', [
+            'action' => 'payment.created',
+            'data_id' => '123',
+        ])
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+    }
+
+    public function test_payment_created_with_invalid_signature_is_rejected(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $this->postJson('/webhooks/mercadopago?data_id=123', [
+            'action' => 'payment.created',
+            'data_id' => '123',
+        ], [
+            'x-request-id' => 'req-1',
+            'x-signature' => 'ts=1,v1=not-a-valid-hmac',
+        ])
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+    }
+
+    public function test_payment_created_missing_query_data_id_is_rejected_even_with_signature_headers(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $headers = $this->paymentCreatedSignatureHeaders('123', 'req-missing-query-data-id', 'wh-secret-test');
+
+        $this->postJson('/webhooks/mercadopago', [
+            'action' => 'payment.created',
+            'data_id' => '123',
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+    }
+
+    public function test_payment_created_accepts_production_data_id_query_param_with_valid_hmac(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $paymentId = 77110066;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-manual-data-id', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload('manual_validation:'.$row->id, $paymentId),
+        ]);
+
+        $response = $this->postMercadoPagoWebhookPreservingDottedDataIdQuery(
+            (string) $paymentId,
+            ['type' => 'payment'],
+            [
+                'action' => 'payment.created',
+                'type' => 'payment',
+                'data' => ['id' => (string) $paymentId],
+            ],
+            $headers
+        );
+
+        $this->assertSame(200, $response->getStatusCode(), $response->getContent());
+        $this->assertSame(['status' => 'success'], json_decode($response->getContent(), true));
+
+        $row->refresh();
+        $this->assertTrue($row->paid);
+        $this->assertSame((string) $paymentId, $row->payment_id);
+    }
+
+    public function test_payment_created_when_provider_returns_no_payment_returns_server_error(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $paymentId = 884422;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-missing-payment', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([$paymentId => ['__simulate_fetch_error' => true]]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertStatus(500)
+            ->assertJson(['error' => 'Could not fetch payment']);
+    }
+
+    public function test_payment_created_with_valid_signature_but_missing_body_data_id_returns_fetch_error(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $queryDataId = 884423;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $queryDataId, 'req-missing-body-id', 'wh-secret-test');
+
+        // Controller reads payment id from body data_id, so with body missing it tries fetching null and fails.
+        $this->postJson('/webhooks/mercadopago?data_id='.$queryDataId, [
+            'action' => 'payment.created',
+        ], $headers)
+            ->assertStatus(500)
+            ->assertJson(['error' => 'Could not fetch payment']);
+    }
+
+    public function test_payment_created_for_manual_validation_marks_request_paid_when_approved(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $paymentId = 77110055;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-manual-ok', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload('manual_validation:'.$row->id, $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $row->refresh();
+        $this->assertTrue($row->paid);
+        $this->assertNotNull($row->paid_at);
+        $this->assertSame((string) $paymentId, $row->payment_id);
+    }
+
+    public function test_payment_created_with_unknown_external_reference_returns_client_error(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $paymentId = 66110022;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-unknown-ref', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload('unclassified-reference', $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Unknown payment type']);
+    }
+
+    public function test_payment_created_with_unparseable_hashed_reference_returns_invalid_external_reference(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $paymentId = 66110023;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-invalid-hash-ref', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload('bad-hash-value:'.base64_encode('Sellado de Viaje ID: 123'), $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid external reference']);
+    }
+
+    public function test_payment_created_with_malformed_hashed_reference_format_returns_invalid_external_reference(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $paymentId = 66110024;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-bad-format-ref', 'wh-secret-test');
+
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload('hash:encoded:extra', $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid external reference']);
+    }
+
+    public function test_order_processed_for_manual_validation_qr_prefix_marks_paid_when_accredited(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $orderId = 'ORD-UPPER-1';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-qr', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'manual_validation_'.$row->id,
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+                'transactions' => [
+                    'payments' => [
+                        ['id' => 'P-QR-99'],
+                    ],
+                ],
+            ],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $row->refresh();
+        $this->assertTrue($row->paid);
+        $this->assertSame('P-QR-99', $row->payment_id);
+    }
+
+    public function test_order_processed_before_accredited_does_not_mark_manual_validation_paid(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $orderId = 'ord-pending-2';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-pending', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'manual_validation_'.$row->id,
+                'status' => 'processed',
+                'status_detail' => 'pending_contingency',
+            ],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $this->assertFalse($row->fresh()->paid);
+    }
+
+    public function test_order_processed_with_missing_external_reference_returns_invalid_payload_error(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $orderId = 'ord-missing-external-reference';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-missing-external', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+            ],
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid payload']);
+    }
+
+    public function test_order_processed_with_invalid_signature_is_rejected(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $orderId = 'ord-invalid-signature';
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'manual_validation_123',
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+            ],
+        ], [
+            'x-request-id' => 'req-invalid-signature',
+            'x-signature' => 'ts=1,v1=invalid-hmac',
+        ])
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+    }
+
+    public function test_order_processed_missing_data_id_query_is_rejected_as_invalid_request(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        // Signature is generated for a valid id, but request omits data.id query param.
+        $headers = $this->orderProcessedSignatureHeaders('order-id-that-will-be-missing', 'req-missing-data-id', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago', [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'manual_validation_123',
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+            ],
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+    }
+
+    public function test_order_processed_with_non_manual_external_reference_is_acknowledged_without_side_effects(): void
+    {
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $orderId = 'ord-non-manual-ref';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-non-manual', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'trip_sellado_non_manual',
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+            ],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+    }
+
+    public function test_order_processed_for_donation_once_qr_prefix_marks_paid_when_accredited(): void
+    {
+        $this->seed(DonationTierSeeder::class);
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $tier = DonationTier::where('slug', 'cafe')->firstOrFail();
+        $user = User::factory()->create();
+        $payment = DonationPayment::create([
+            'user_id' => $user->id,
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => 500000,
+            'status' => 'pending',
+        ]);
+        $payment->external_reference = 'donation_once_'.$payment->id;
+        $payment->save();
+
+        $orderId = 'ORD-DONATE-QR-1';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-donate-qr', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'donation_once_'.$payment->id,
+                'status' => 'processed',
+                'status_detail' => 'accredited',
+                'transactions' => [
+                    'payments' => [
+                        ['id' => 'P-DONATE-QR-1'],
+                    ],
+                ],
+            ],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $payment->refresh();
+        $this->assertSame('approved', $payment->status);
+        $this->assertSame('P-DONATE-QR-1', $payment->mp_payment_id);
+        $this->assertNotNull($payment->paid_at);
+    }
+
+    public function test_order_processed_before_accredited_does_not_mark_donation_once_paid(): void
+    {
+        $this->seed(DonationTierSeeder::class);
+        config(['services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-test']);
+
+        $tier = DonationTier::where('slug', 'cafe')->firstOrFail();
+        $payment = DonationPayment::create([
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => 500000,
+            'status' => 'pending',
+        ]);
+
+        $orderId = 'ord-donate-pending';
+        $headers = $this->orderProcessedSignatureHeaders($orderId, 'req-order-donate-pending', 'wh-secret-qr-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => $orderId]), [
+            'action' => 'order.processed',
+            'data' => [
+                'external_reference' => 'donation_once_'.$payment->id,
+                'status' => 'processed',
+                'status_detail' => 'pending_contingency',
+            ],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $this->assertSame('pending', $payment->fresh()->status);
+    }
+
+    public function test_payment_created_for_donation_once_qr_prefix_marks_paid_when_approved(): void
+    {
+        $this->seed(DonationTierSeeder::class);
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $tier = DonationTier::where('slug', 'cafe')->firstOrFail();
+        $user = User::factory()->create();
+        $payment = DonationPayment::create([
+            'user_id' => $user->id,
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => 500000,
+            'status' => 'pending',
+        ]);
+
+        $mpPaymentId = 555666777;
+        $externalReference = 'donation_once_'.$payment->id;
+        $this->stubMercadoPagoPayments([
+            $mpPaymentId => $this->mercadoPagoPaymentPayload($externalReference, $mpPaymentId, [
+                'transaction_amount' => 5000.0,
+                'date_approved' => '2026-10-08T12:00:00.000-00:00',
+            ]),
+        ]);
+
+        $headers = $this->paymentCreatedSignatureHeaders((string) $mpPaymentId, 'req-donate-qr-created', 'wh-secret-test');
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query(['data.id' => (string) $mpPaymentId]), [
+            'action' => 'payment.created',
+            'data_id' => (string) $mpPaymentId,
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $payment->refresh();
+        $this->assertSame('approved', $payment->status);
+        $this->assertSame((string) $mpPaymentId, $payment->mp_payment_id);
+        $this->assertNotNull($payment->paid_at);
+    }
+
+    public function test_merchant_order_closed_marks_donation_once_paid_when_signed_with_qr_secret(): void
+    {
+        $this->seed(DonationTierSeeder::class);
+        config([
+            'services.mercadopago.webhook_secret' => 'wh-secret-checkout',
+            'services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr',
+            'services.mercadopago.qr_payment_client_id' => '2333034981366591',
+            'services.mercadopago.access_token' => 'test-access-token',
+        ]);
+
+        $tier = DonationTier::where('slug', 'cafe')->firstOrFail();
+        $payment = DonationPayment::create([
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => 500000,
+            'status' => 'pending',
+        ]);
+
+        $merchantOrderId = 42085488099;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $merchantOrderId, 'req-merchant-order-donate-qr', 'wh-secret-qr');
+
+        Http::fake([
+            'api.mercadopago.com/merchant_orders/'.$merchantOrderId => Http::response([
+                'id' => $merchantOrderId,
+                'status' => 'closed',
+                'external_reference' => 'donation_once_'.$payment->id,
+                'payments' => [
+                    ['id' => 88990011, 'status' => 'approved'],
+                ],
+            ], 200),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data_id' => $merchantOrderId,
+            'type' => 'topic_merchant_order_wh',
+        ]), [
+            'action' => 'update',
+            'status' => 'closed',
+            'application_id' => '2333034981366591',
+            'type' => 'topic_merchant_order_wh',
+            'data_id' => (string) $merchantOrderId,
+            'data' => ['status' => 'closed'],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $payment->refresh();
+        $this->assertSame('approved', $payment->status);
+        $this->assertSame('88990011', $payment->mp_payment_id);
+    }
+
+    public function test_payment_created_for_trip_sellado_marks_payment_and_trip_ready_when_approved(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $driver = User::factory()->create();
+        $trip = Trip::factory()->create([
+            'user_id' => $driver->id,
+            'is_passenger' => 0,
+            'state' => Trip::STATE_PENDING_PAYMENT,
+        ]);
+
+        $paymentId = 55001133;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-sellado', 'wh-secret-test');
+
+        $external = $this->hashedSelladoExternalReference($trip->id);
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload($external, $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $this->assertDatabaseHas('payment_attempts', [
+            'trip_id' => $trip->id,
+            'payment_id' => $paymentId,
+            'payment_status' => PaymentAttempt::STATUS_COMPLETED,
+        ]);
+
+        $this->assertSame(Trip::STATE_READY, $trip->fresh()->state);
+    }
+
+    public function test_payment_created_for_trip_sellado_with_preapproval_id_still_routes_to_trip_not_club(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $driver = User::factory()->create();
+        $trip = Trip::factory()->create([
+            'user_id' => $driver->id,
+            'is_passenger' => 0,
+            'state' => Trip::STATE_PENDING_PAYMENT,
+        ]);
+
+        $clubUser = User::factory()->create();
+        $this->seed(DonationTierSeeder::class);
+        DonationSubscription::create([
+            'user_id' => $clubUser->id,
+            'donation_tier_id' => DonationTier::where('slug', 'cafe')->firstOrFail()->id,
+            'mp_preapproval_id' => 'dummy-club-preapproval-on-payment',
+            'status' => 'authorized',
+            'transaction_amount_cents' => 500000,
+        ]);
+
+        $paymentId = 55001144;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-sellado-club-ref', 'wh-secret-test');
+
+        $external = $this->hashedSelladoExternalReference($trip->id);
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload($external, $paymentId, [
+                'preapproval_id' => 'dummy-club-preapproval-on-payment',
+            ]),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertOk();
+
+        $this->assertDatabaseHas('payment_attempts', [
+            'trip_id' => $trip->id,
+            'payment_id' => $paymentId,
+        ]);
+        $this->assertDatabaseMissing('donation_subscription_charges', [
+            'mp_payment_id' => (string) $paymentId,
+        ]);
+    }
+
+    public function test_payment_created_for_trip_sellado_persists_mercadopago_metadata_fields(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $driver = User::factory()->create();
+        $trip = Trip::factory()->create([
+            'user_id' => $driver->id,
+            'is_passenger' => 0,
+            'state' => Trip::STATE_PENDING_PAYMENT,
+        ]);
+
+        $paymentId = 55001134;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $paymentId, 'req-sellado-metadata', 'wh-secret-test');
+
+        $external = $this->hashedSelladoExternalReference($trip->id);
+        $this->stubMercadoPagoPayments([
+            $paymentId => $this->mercadoPagoPaymentPayload($external, $paymentId),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?data_id='.$paymentId, [
+            'action' => 'payment.created',
+            'data_id' => (string) $paymentId,
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $attempt = PaymentAttempt::query()->where('payment_id', $paymentId)->firstOrFail();
+        $this->assertSame(PaymentAttempt::STATUS_COMPLETED, $attempt->payment_status);
+        $this->assertIsArray($attempt->payment_data);
+        $this->assertArrayHasKey('status', $attempt->payment_data);
+        $this->assertArrayHasKey('status_detail', $attempt->payment_data);
+        $this->assertArrayHasKey('amount', $attempt->payment_data);
+        $this->assertArrayHasKey('currency_id', $attempt->payment_data);
+        $this->assertArrayHasKey('payment_method_id', $attempt->payment_data);
+        $this->assertArrayHasKey('payment_type_id', $attempt->payment_data);
+        $this->assertArrayHasKey('external_reference', $attempt->payment_data);
+        $this->assertArrayHasKey('date_created', $attempt->payment_data);
+        $this->assertArrayHasKey('date_approved', $attempt->payment_data);
+        $this->assertArrayHasKey('date_last_updated', $attempt->payment_data);
+    }
+
+    public function test_merchant_order_closed_marks_manual_validation_paid_when_signed_with_qr_secret(): void
+    {
+        config([
+            'services.mercadopago.webhook_secret' => 'wh-secret-checkout',
+            'services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr',
+            'services.mercadopago.qr_payment_client_id' => '2333034981366591',
+            'services.mercadopago.access_token' => 'test-access-token',
+        ]);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $merchantOrderId = 42085488043;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $merchantOrderId, 'req-merchant-order-qr-secret', 'wh-secret-qr');
+
+        Http::fake([
+            'api.mercadopago.com/merchant_orders/'.$merchantOrderId => Http::response([
+                'id' => $merchantOrderId,
+                'status' => 'closed',
+                'external_reference' => 'manual_validation_'.$row->id,
+                'external_pos_id' => 'carpoolearmanualvalidationposprod1',
+                'payments' => [
+                    ['id' => 99112233, 'status' => 'approved'],
+                ],
+            ], 200),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data_id' => $merchantOrderId,
+            'type' => 'topic_merchant_order_wh',
+        ]), [
+            'action' => 'update',
+            'status' => 'closed',
+            'application_id' => '2333034981366591',
+            'type' => 'topic_merchant_order_wh',
+            'data_id' => (string) $merchantOrderId,
+            'data' => ['status' => 'closed'],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $row->refresh();
+        $this->assertTrue($row->paid);
+        $this->assertSame('99112233', $row->payment_id);
+    }
+
+    public function test_merchant_order_closed_marks_manual_validation_paid_with_checkout_secret(): void
+    {
+        config([
+            'services.mercadopago.webhook_secret' => 'wh-secret-test',
+            'services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr-unused',
+            'services.mercadopago.access_token' => 'test-access-token',
+        ]);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $merchantOrderId = 42085488043;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $merchantOrderId, 'req-merchant-order-closed', 'wh-secret-test');
+
+        Http::fake([
+            'api.mercadopago.com/merchant_orders/'.$merchantOrderId => Http::response([
+                'id' => $merchantOrderId,
+                'status' => 'closed',
+                'external_reference' => 'manual_validation_'.$row->id,
+                'payments' => [
+                    ['id' => 99112233, 'status' => 'approved'],
+                ],
+            ], 200),
+        ]);
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data_id' => $merchantOrderId,
+            'type' => 'topic_merchant_order_wh',
+        ]), [
+            'action' => 'update',
+            'status' => 'closed',
+            'type' => 'topic_merchant_order_wh',
+            'data_id' => (string) $merchantOrderId,
+            'data' => ['status' => 'closed'],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $row->refresh();
+        $this->assertTrue($row->paid);
+        $this->assertSame('99112233', $row->payment_id);
+    }
+
+    public function test_merchant_order_closed_rejects_signature_that_matches_neither_secret(): void
+    {
+        config([
+            'services.mercadopago.webhook_secret' => 'wh-secret-checkout',
+            'services.mercadopago.webhook_secret_qr_payment' => 'wh-secret-qr',
+            'services.mercadopago.qr_payment_client_id' => '2333034981366591',
+        ]);
+
+        $merchantOrderId = 42085488045;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $merchantOrderId, 'req-merchant-order-wrong-secret', 'wh-secret-wrong');
+
+        Http::fake();
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data_id' => $merchantOrderId,
+            'type' => 'topic_merchant_order_wh',
+        ]), [
+            'action' => 'update',
+            'status' => 'closed',
+            'application_id' => '2333034981366591',
+            'type' => 'topic_merchant_order_wh',
+            'data_id' => (string) $merchantOrderId,
+            'data' => ['status' => 'closed'],
+        ], $headers)
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Invalid request']);
+
+        Http::assertNothingSent();
+    }
+
+    public function test_merchant_order_opened_does_not_mark_manual_validation_paid(): void
+    {
+        config(['services.mercadopago.webhook_secret' => 'wh-secret-test']);
+
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $merchantOrderId = 42085488044;
+        $headers = $this->paymentCreatedSignatureHeaders((string) $merchantOrderId, 'req-merchant-order-opened', 'wh-secret-test');
+
+        Http::fake();
+
+        $this->postJson('/webhooks/mercadopago?'.http_build_query([
+            'data_id' => $merchantOrderId,
+            'type' => 'topic_merchant_order_wh',
+        ]), [
+            'action' => 'create',
+            'status' => 'opened',
+            'type' => 'topic_merchant_order_wh',
+            'data_id' => (string) $merchantOrderId,
+            'data' => ['status' => 'opened'],
+        ], $headers)
+            ->assertOk()
+            ->assertExactJson(['status' => 'success']);
+
+        $this->assertFalse($row->fresh()->paid);
+        Http::assertNothingSent();
+    }
+}

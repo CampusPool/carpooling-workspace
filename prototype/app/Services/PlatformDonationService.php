@@ -1,0 +1,783 @@
+<?php
+
+namespace STS\Services;
+
+use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use STS\Jobs\UpdateDonationSubscriptionAmountsJob;
+use STS\Models\DonationAmountAdjustment;
+use STS\Models\DonationPayment;
+use STS\Models\DonationSubscription;
+use STS\Models\DonationSubscriptionCharge;
+use STS\Models\DonationTier;
+use STS\Models\User;
+
+class PlatformDonationService
+{
+    public function __construct(
+        private MercadoPagoService $mercadoPagoService,
+        private ClubCarpoolearMembershipService $clubCarpoolearMembershipService
+    ) {}
+
+    public function isEnabled(): bool
+    {
+        return (bool) config('carpoolear.platform_donations_api_enabled', false);
+    }
+
+    public function isQrEnabled(): bool
+    {
+        return $this->isEnabled()
+            && (bool) config('carpoolear.platform_donations_qr_enabled', false)
+            && ! empty(config('services.mercadopago.qr_payment_access_token'))
+            && ! empty(config('carpoolear.qr_payment_pos_external_id'));
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function listActiveTiers(): array
+    {
+        return DonationTier::query()
+            ->active()
+            ->orderBy('sort_order')
+            ->get()
+            ->map(fn (DonationTier $tier) => $this->formatTier($tier))
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function formatTier(DonationTier $tier): array
+    {
+        return [
+            'id' => $tier->id,
+            'slug' => $tier->slug,
+            'label_key' => $tier->label_key,
+            'amount' => (int) ($tier->amount_cents / 100),
+            'amount_cents' => $tier->amount_cents,
+            'icon' => $tier->icon,
+            'is_active' => $tier->is_active,
+            'sort_order' => $tier->sort_order,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array{init_point: string, payment_id: int}
+     */
+    public function checkoutOnce(?User $user, array $data): array
+    {
+        $tier = $this->resolveTier($data);
+        $payment = DonationPayment::create([
+            'user_id' => $user?->id,
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => $tier->amount_cents,
+            'currency' => 'ARS',
+            'status' => 'pending',
+            'source' => $data['source'] ?? null,
+            'trip_id' => $data['trip_id'] ?? null,
+        ]);
+
+        $preference = $this->mercadoPagoService->createPaymentPreferenceForPlatformDonation($payment);
+        $payment->mp_preference_id = $preference->id ?? null;
+        $payment->external_reference = $this->mercadoPagoService->createHashedExternalReferenceForPlatformDonation(
+            $payment->id,
+            'once',
+            $user?->id ?? 'Anonymous',
+            $tier->slug
+        );
+        $payment->save();
+
+        return [
+            'init_point' => $preference->init_point,
+            'payment_id' => $payment->id,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array{payment_id: int, qr_data: string, order_id: string}
+     */
+    public function checkoutOnceQr(?User $user, array $data): array
+    {
+        $tier = $this->resolveTier($data);
+        $payment = DonationPayment::create([
+            'user_id' => $user?->id,
+            'donation_tier_id' => $tier->id,
+            'amount_cents' => $tier->amount_cents,
+            'currency' => 'ARS',
+            'status' => 'pending',
+            'source' => $data['source'] ?? null,
+            'trip_id' => $data['trip_id'] ?? null,
+        ]);
+
+        try {
+            $result = $this->mercadoPagoService->createQrOrderForPlatformDonation($payment);
+        } catch (\Throwable $e) {
+            $payment->delete();
+            throw $e;
+        }
+
+        if (empty($result['qr_data'])) {
+            $payment->delete();
+            throw new \RuntimeException('Failed to create QR order.');
+        }
+
+        $payment->external_reference = 'donation_once_'.$payment->id;
+        $payment->save();
+
+        return [
+            'payment_id' => $payment->id,
+            'qr_data' => $result['qr_data'],
+            'order_id' => $result['order_id'] ?? '',
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array{init_point: string, subscription_id: int}
+     */
+    public function checkoutMonthly(User $user, array $data): array
+    {
+        $tier = $this->resolveTier($data);
+        // One Mercado Pago preapproval *plan* per tier (shared price template). Each user still
+        // gets their own MP preapproval/subscription row after they complete hosted checkout.
+        if (empty($tier->mp_preapproval_plan_id)) {
+            $plan = $this->mercadoPagoService->createPreapprovalPlan($tier);
+            $tier->mp_preapproval_plan_id = $plan->id ?? null;
+            $tier->save();
+        }
+
+        $subscription = DonationSubscription::create([
+            'user_id' => $user->id,
+            'donation_tier_id' => $tier->id,
+            'mp_preapproval_plan_id' => $tier->mp_preapproval_plan_id,
+            'status' => 'pending',
+            'transaction_amount_cents' => $tier->amount_cents,
+            'source' => $data['source'] ?? null,
+            'trip_id' => $data['trip_id'] ?? null,
+        ]);
+
+        $subscription->external_reference = $this->mercadoPagoService->createHashedExternalReferenceForPlatformDonation(
+            $subscription->id,
+            'monthly',
+            $user->id,
+            $tier->slug
+        );
+        $subscription->save();
+
+        $checkoutUrl = $this->mercadoPagoService->createPreapprovalCheckoutUrl($subscription);
+
+        return [
+            'init_point' => $checkoutUrl,
+            'subscription_id' => $subscription->id,
+        ];
+    }
+
+    /**
+     * QR Orders API cannot use hashed references (colons are rejected).
+     * external_reference: donation_once_{id}
+     *
+     * @param  array<string, mixed>  $mpPayment
+     */
+    public function handleQrOnceOrder(string $externalReference, array $mpPayment): bool
+    {
+        if (! str_starts_with($externalReference, 'donation_once_')) {
+            return false;
+        }
+
+        $paymentId = (int) substr($externalReference, strlen('donation_once_'));
+        if ($paymentId <= 0) {
+            return false;
+        }
+
+        $this->applyOneTimePayment($paymentId, null, $mpPayment);
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    public function handlePlatformPayment(array $mpPayment): void
+    {
+        $decodedReference = $this->decodeExternalReference($mpPayment['external_reference'] ?? '');
+        if ($decodedReference === null) {
+            throw new \InvalidArgumentException('Invalid platform donation external reference');
+        }
+
+        if (! preg_match(
+            '/Donación Plataforma ID: (\d+); Tipo: (\w+); User ID: ([^;]+); Tier: (\w+)/',
+            $decodedReference,
+            $matches
+        )) {
+            throw new \InvalidArgumentException('Invalid platform donation reference format');
+        }
+
+        $recordId = (int) $matches[1];
+        $type = $matches[2];
+        $userId = $matches[3] === 'Anonymous' ? null : (int) $matches[3];
+
+        if ($type === 'once') {
+            $this->applyOneTimePayment($recordId, $userId, $mpPayment);
+
+            return;
+        }
+
+        if ($type === 'monthly') {
+            $this->applySubscriptionCharge($recordId, $mpPayment);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $preapproval
+     */
+    public function handleSubscriptionPreapproval(array $preapproval): void
+    {
+        $subscription = $this->findSubscriptionFromPreapproval($preapproval)
+            ?? $this->createSubscriptionFromPreapproval($preapproval);
+
+        if (! $subscription) {
+            Log::warning('MercadoPago preapproval webhook could not be matched or created', [
+                'preapproval_id' => $preapproval['id'] ?? null,
+                'has_external_reference' => ! empty($preapproval['external_reference']),
+            ]);
+
+            return;
+        }
+
+        $mpStatus = strtolower((string) ($preapproval['status'] ?? ''));
+        $subscription->mp_preapproval_id = $preapproval['id'] ?? $subscription->mp_preapproval_id;
+        $subscription->status = $this->mapPreapprovalStatus($mpStatus);
+        $subscription->transaction_amount_cents = $this->amountCentsFromMp(
+            $preapproval['auto_recurring']['transaction_amount'] ?? ($subscription->transaction_amount_cents / 100)
+        );
+
+        if (! empty($preapproval['next_payment_date'])) {
+            $subscription->next_payment_date = Carbon::parse($preapproval['next_payment_date'])->toDateString();
+        }
+
+        if (! empty($preapproval['preapproval_plan_id']) && empty($subscription->mp_preapproval_plan_id)) {
+            $subscription->mp_preapproval_plan_id = $preapproval['preapproval_plan_id'];
+        }
+
+        $subscription->save();
+
+        $user = $subscription->user_id ? User::find($subscription->user_id) : null;
+        if (! $user) {
+            Log::warning('MercadoPago preapproval webhook could not resolve user', [
+                'subscription_id' => $subscription->id,
+                'preapproval_id' => $preapproval['id'] ?? null,
+                'user_id' => $subscription->user_id,
+            ]);
+        } else {
+            $user->monthly_donate = $subscription->status === 'authorized';
+            $user->save();
+
+            if ($subscription->status === 'authorized') {
+                $this->clubCarpoolearMembershipService->applyAuthorizedMembership($user);
+            } elseif (in_array($subscription->status, ['cancelled', 'paused'], true)) {
+                $this->clubCarpoolearMembershipService->applyCancelledMembership($user);
+            }
+        }
+
+        if ($subscription->status === 'authorized') {
+            $this->writeLegacyDonationIntent($subscription->user_id, (float) ($subscription->transaction_amount_cents / 100), true);
+        }
+
+        if ($subscription->status === 'cancelled') {
+            $this->writeLegacyDonationIntent($subscription->user_id, 0, false);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    public function handleSubscriptionAuthorizedPayment(array $mpPayment): void
+    {
+        $metadata = $mpPayment['metadata'] ?? null;
+        $preapprovalId = $mpPayment['preapproval_id'] ?? (is_array($metadata) ? ($metadata['preapproval_id'] ?? null) : null);
+        $subscription = null;
+
+        if ($preapprovalId) {
+            $subscription = DonationSubscription::query()
+                ->where('mp_preapproval_id', $preapprovalId)
+                ->first();
+        }
+
+        if (! $subscription) {
+            $externalReference = $mpPayment['external_reference'] ?? '';
+            $decodedReference = $this->decodeExternalReference($externalReference);
+            if ($decodedReference && preg_match('/Donación Plataforma ID: (\d+)/', $decodedReference, $matches)) {
+                $subscription = DonationSubscription::find((int) $matches[1]);
+            }
+        }
+
+        if (! $subscription && $preapprovalId) {
+            $alreadyLinked = DonationSubscription::query()
+                ->where('mp_preapproval_id', $preapprovalId)
+                ->exists();
+
+            if (! $alreadyLinked) {
+                $preapproval = $this->mercadoPagoService->getPreapproval((string) $preapprovalId);
+                if ($preapproval) {
+                    $this->handleSubscriptionPreapproval($preapproval);
+                }
+            }
+
+            $subscription = DonationSubscription::query()
+                ->where('mp_preapproval_id', $preapprovalId)
+                ->first();
+        }
+
+        if (! $subscription) {
+            Log::warning('MercadoPago subscription charge webhook could not match subscription', [
+                'payment_id' => $mpPayment['id'] ?? null,
+                'preapproval_id' => $preapprovalId,
+                'external_reference' => $mpPayment['external_reference'] ?? null,
+            ]);
+
+            return;
+        }
+
+        $this->upsertSubscriptionCharge($subscription, $mpPayment);
+    }
+
+    /**
+     * @param  array<string, mixed>  $invoice
+     * @return array<string, mixed>|null
+     */
+    public function mapAuthorizedPaymentInvoiceToChargePayload(array $invoice): ?array
+    {
+        $nestedPayment = $invoice['payment'] ?? null;
+        if (! is_array($nestedPayment) || empty($nestedPayment['id'])) {
+            return null;
+        }
+
+        return [
+            'id' => $nestedPayment['id'],
+            'preapproval_id' => $invoice['preapproval_id'] ?? null,
+            'status' => $nestedPayment['status'] ?? ($invoice['status'] ?? 'pending'),
+            'transaction_amount' => $nestedPayment['transaction_amount'] ?? $invoice['transaction_amount'] ?? 0,
+            'amount' => $nestedPayment['transaction_amount'] ?? $invoice['transaction_amount'] ?? 0,
+            'date_approved' => $nestedPayment['date_approved'] ?? null,
+            'external_reference' => $invoice['external_reference'] ?? '',
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    public function handleClubSubscriptionPaymentViaInvoiceSearch(array $mpPayment, string $paymentId): bool
+    {
+        $results = $this->mercadoPagoService->searchAuthorizedPayments(['payment_id' => $paymentId]);
+        $invoice = $results[0] ?? null;
+        if (! is_array($invoice)) {
+            Log::info('Club subscription payment could not resolve invoice by payment_id', [
+                'payment_id' => $paymentId,
+            ]);
+
+            return false;
+        }
+
+        $preapprovalId = $invoice['preapproval_id'] ?? null;
+        if (! is_string($preapprovalId) || $preapprovalId === '') {
+            Log::info('Club subscription invoice missing preapproval_id', [
+                'payment_id' => $paymentId,
+                'invoice_id' => $invoice['id'] ?? null,
+            ]);
+
+            return false;
+        }
+
+        $chargePayment = $mpPayment;
+        $chargePayment['preapproval_id'] = $preapprovalId;
+
+        if (! DonationSubscription::query()->where('mp_preapproval_id', $preapprovalId)->exists()) {
+            $preapproval = $this->mercadoPagoService->getPreapproval($preapprovalId);
+            if ($preapproval) {
+                $this->handleSubscriptionPreapproval($preapproval);
+            }
+        }
+
+        $this->handleSubscriptionAuthorizedPayment($chargePayment);
+
+        return true;
+    }
+
+    public function applyInflation(DonationTier $tier, int $newAmountCents, int $adminUserId): DonationAmountAdjustment
+    {
+        $oldAmountCents = $tier->amount_cents;
+        $tier->amount_cents = $newAmountCents;
+        $plan = $this->mercadoPagoService->createPreapprovalPlan($tier);
+
+        $tier->mp_preapproval_plan_id = $plan->id ?? $tier->mp_preapproval_plan_id;
+        $tier->effective_from = now();
+        $tier->save();
+
+        $adjustment = DonationAmountAdjustment::create([
+            'donation_tier_id' => $tier->id,
+            'old_amount_cents' => $oldAmountCents,
+            'new_amount_cents' => $newAmountCents,
+            'admin_user_id' => $adminUserId,
+        ]);
+
+        UpdateDonationSubscriptionAmountsJob::dispatch($adjustment->id);
+
+        return $adjustment;
+    }
+
+    public function syncSubscriptionAmountsForAdjustment(DonationAmountAdjustment $adjustment): void
+    {
+        $tier = $adjustment->tier;
+        $updated = 0;
+        $failed = 0;
+
+        DonationSubscription::query()
+            ->where('donation_tier_id', $tier->id)
+            ->where('status', 'authorized')
+            ->whereNotNull('mp_preapproval_id')
+            ->orderBy('id')
+            ->chunkById(20, function ($subscriptions) use ($adjustment, &$updated, &$failed) {
+                foreach ($subscriptions as $subscription) {
+                    try {
+                        $this->mercadoPagoService->updatePreapprovalAmount(
+                            $subscription->mp_preapproval_id,
+                            $adjustment->new_amount_cents
+                        );
+                        $subscription->transaction_amount_cents = $adjustment->new_amount_cents;
+                        $subscription->save();
+                        $updated++;
+                    } catch (\Throwable $e) {
+                        \Log::error('Failed to update donation subscription amount', [
+                            'subscription_id' => $subscription->id,
+                            'mp_preapproval_id' => $subscription->mp_preapproval_id,
+                            'message' => $e->getMessage(),
+                        ]);
+                        $failed++;
+                    }
+                }
+            });
+
+        $adjustment->subscriptions_updated = $updated;
+        $adjustment->subscriptions_failed = $failed;
+        $adjustment->applied_at = now();
+        $adjustment->save();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function summary(): array
+    {
+        $oneTimeTotal = (int) DonationPayment::query()->where('status', 'approved')->sum('amount_cents');
+        $recurringTotal = (int) DonationSubscriptionCharge::query()->where('status', 'approved')->sum('amount_cents');
+        $activeSubscriptions = DonationSubscription::query()->where('status', 'authorized')->count();
+        $mrrCents = (int) DonationSubscription::query()
+            ->where('status', 'authorized')
+            ->sum('transaction_amount_cents');
+
+        return [
+            'total_donated_cents' => $oneTimeTotal + $recurringTotal,
+            'one_time_total_cents' => $oneTimeTotal,
+            'recurring_total_cents' => $recurringTotal,
+            'active_subscriptions' => $activeSubscriptions,
+            'estimated_mrr_cents' => $mrrCents,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    private function resolveTier(array $data): DonationTier
+    {
+        if (! empty($data['tier_id'])) {
+            return DonationTier::query()->active()->findOrFail($data['tier_id']);
+        }
+
+        if (! empty($data['amount'])) {
+            $amountCents = (int) $data['amount'] * 100;
+
+            return DonationTier::query()
+                ->active()
+                ->where('amount_cents', $amountCents)
+                ->firstOrFail();
+        }
+
+        throw new \InvalidArgumentException('tier_id or amount is required');
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    private function applyOneTimePayment(int $paymentId, ?int $userId, array $mpPayment): void
+    {
+        $payment = DonationPayment::find($paymentId);
+        if (! $payment) {
+            return;
+        }
+
+        $status = $this->mapPaymentStatus($mpPayment['status'] ?? 'pending');
+        $payment->status = $status;
+        $payment->mp_payment_id = (string) ($mpPayment['id'] ?? $payment->mp_payment_id);
+        if ($status === 'approved') {
+            $payment->paid_at = ! empty($mpPayment['date_approved'])
+                ? Carbon::parse($mpPayment['date_approved'])
+                : now();
+        }
+        $payment->save();
+
+        if ($status === 'approved') {
+            $this->writeLegacyDonationIntent($payment->user_id ?? $userId, (float) ($payment->amount_cents / 100), true);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    private function applySubscriptionCharge(int $subscriptionId, array $mpPayment): void
+    {
+        $subscription = DonationSubscription::find($subscriptionId);
+        if (! $subscription) {
+            return;
+        }
+
+        $this->upsertSubscriptionCharge($subscription, $mpPayment);
+    }
+
+    /**
+     * @param  array<string, mixed>  $mpPayment
+     */
+    private function upsertSubscriptionCharge(DonationSubscription $subscription, array $mpPayment): void
+    {
+        $mpPaymentId = (string) ($mpPayment['id'] ?? '');
+        if ($mpPaymentId === '') {
+            return;
+        }
+
+        $status = $this->mapPaymentStatus($mpPayment['status'] ?? 'pending');
+        $amountCents = $this->amountCentsFromMp(
+            $mpPayment['transaction_amount'] ?? $mpPayment['amount'] ?? 0
+        );
+
+        DonationSubscriptionCharge::updateOrCreate(
+            ['mp_payment_id' => $mpPaymentId],
+            [
+                'donation_subscription_id' => $subscription->id,
+                'amount_cents' => $amountCents,
+                'status' => $status,
+                'charged_at' => ! empty($mpPayment['date_approved'])
+                    ? Carbon::parse($mpPayment['date_approved'])
+                    : now(),
+            ]
+        );
+
+        if ($status === 'approved') {
+            $subscription->last_charged_at = ! empty($mpPayment['date_approved'])
+                ? Carbon::parse($mpPayment['date_approved'])
+                : now();
+            $subscription->save();
+            $this->writeLegacyDonationIntent($subscription->user_id, (float) ($amountCents / 100), true);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $preapproval
+     */
+    private function findSubscriptionFromPreapproval(array $preapproval): ?DonationSubscription
+    {
+        $preapprovalId = $preapproval['id'] ?? null;
+        if ($preapprovalId) {
+            $byMpId = DonationSubscription::query()->where('mp_preapproval_id', $preapprovalId)->first();
+            if ($byMpId) {
+                return $byMpId;
+            }
+        }
+
+        $externalReference = $preapproval['external_reference'] ?? '';
+        $decodedReference = $this->decodeExternalReference($externalReference);
+        if ($decodedReference && preg_match('/Donación Plataforma ID: (\d+)/', $decodedReference, $matches)) {
+            return DonationSubscription::find((int) $matches[1]);
+        }
+
+        return $this->findPendingSubscriptionForPreapproval($preapproval);
+    }
+
+    /**
+     * Hosted plan checkout does not send our hashed external_reference to Mercado Pago.
+     *
+     * @param  array<string, mixed>  $preapproval
+     */
+    private function findPendingSubscriptionForPreapproval(array $preapproval): ?DonationSubscription
+    {
+        $planId = $preapproval['preapproval_plan_id'] ?? null;
+        if (! $planId) {
+            return null;
+        }
+
+        $query = DonationSubscription::query()
+            ->where('status', 'pending')
+            ->where(function ($builder) {
+                $builder->whereNull('mp_preapproval_id')->orWhere('mp_preapproval_id', '');
+            })
+            ->where(function ($builder) use ($planId) {
+                $builder->where('mp_preapproval_plan_id', $planId)
+                    ->orWhereHas('tier', fn ($tier) => $tier->where('mp_preapproval_plan_id', $planId));
+            });
+
+        $payerEmail = $preapproval['payer_email'] ?? null;
+        if (is_string($payerEmail) && $payerEmail !== '') {
+            $userId = User::query()->where('email', $payerEmail)->value('id');
+            if ($userId) {
+                $query->where('user_id', $userId);
+            }
+        }
+
+        return $query->orderByDesc('id')->first();
+    }
+
+    /**
+     * @param  array<string, mixed>  $preapproval
+     */
+    private function createSubscriptionFromPreapproval(array $preapproval): ?DonationSubscription
+    {
+        $preapprovalId = $preapproval['id'] ?? null;
+        if (! $preapprovalId) {
+            return null;
+        }
+
+        $decodedReference = $this->decodeExternalReference((string) ($preapproval['external_reference'] ?? ''));
+        $user = $this->resolveUserFromDecodedPlatformReference($decodedReference);
+        $tier = $this->resolveTierFromPreapproval($preapproval, $decodedReference);
+        $amountCents = $this->amountCentsFromMp(
+            $preapproval['auto_recurring']['transaction_amount'] ?? 0
+        );
+
+        return DonationSubscription::create([
+            'user_id' => $user?->id,
+            'donation_tier_id' => $tier?->id,
+            'mp_preapproval_id' => (string) $preapprovalId,
+            'mp_preapproval_plan_id' => $preapproval['preapproval_plan_id'] ?? $tier?->mp_preapproval_plan_id,
+            'status' => 'pending',
+            'transaction_amount_cents' => $amountCents > 0 ? $amountCents : (int) ($tier?->amount_cents ?? 0),
+            'external_reference' => $preapproval['external_reference'] ?? null,
+            'source' => 'monthly',
+        ]);
+    }
+
+    private function resolveUserFromDecodedPlatformReference(?string $decodedReference): ?User
+    {
+        if ($decodedReference === null) {
+            return null;
+        }
+
+        if (! preg_match('/User ID: ([^;]+)/', $decodedReference, $matches)) {
+            return null;
+        }
+
+        if ($matches[1] === 'Anonymous') {
+            return null;
+        }
+
+        return User::find((int) $matches[1]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $preapproval
+     */
+    private function resolveTierFromPreapproval(array $preapproval, ?string $decodedReference): ?DonationTier
+    {
+        $planId = $preapproval['preapproval_plan_id'] ?? null;
+        if ($planId) {
+            $byPlan = DonationTier::query()->where('mp_preapproval_plan_id', $planId)->first();
+            if ($byPlan) {
+                return $byPlan;
+            }
+        }
+
+        if ($decodedReference && preg_match('/Tier: (\w+)/', $decodedReference, $matches)) {
+            $bySlug = DonationTier::query()->where('slug', $matches[1])->first();
+            if ($bySlug) {
+                return $bySlug;
+            }
+        }
+
+        $amountCents = $this->amountCentsFromMp($preapproval['auto_recurring']['transaction_amount'] ?? 0);
+        if ($amountCents > 0) {
+            return DonationTier::query()->where('amount_cents', $amountCents)->first();
+        }
+
+        return null;
+    }
+
+    private function decodeExternalReference(string $externalReference): ?string
+    {
+        if ($externalReference === '') {
+            return null;
+        }
+
+        if (strpos($externalReference, ':') === false) {
+            return $externalReference;
+        }
+
+        $parts = explode(':', $externalReference, 2);
+        if (count($parts) !== 2) {
+            return null;
+        }
+
+        $referenceString = base64_decode($parts[1]);
+        $salt = config('services.mercadopago.reference_salt', 'carpoolear_2024_secure_salt');
+        $expectedHash = hash('sha256', $referenceString.$salt);
+
+        if (! hash_equals($parts[0], $expectedHash)) {
+            return null;
+        }
+
+        return $referenceString;
+    }
+
+    private function mapPaymentStatus(string $mpStatus): string
+    {
+        return match ($mpStatus) {
+            'approved' => 'approved',
+            'refunded', 'charged_back' => 'refunded',
+            'rejected', 'cancelled' => 'rejected',
+            default => 'pending',
+        };
+    }
+
+    private function mapPreapprovalStatus(string $mpStatus): string
+    {
+        return match ($mpStatus) {
+            'authorized' => 'authorized',
+            'paused' => 'paused',
+            'cancelled' => 'cancelled',
+            default => 'pending',
+        };
+    }
+
+    private function amountCentsFromMp(float|int|string $amount): int
+    {
+        return (int) round(((float) $amount) * 100);
+    }
+
+    private function writeLegacyDonationIntent(?int $userId, float $amount, bool $hasDonated): void
+    {
+        if (! $userId) {
+            return;
+        }
+
+        DB::table('donations')->insert([
+            'user_id' => $userId,
+            'month' => now()->format('Y-m'),
+            'has_donated' => $hasDonated ? 1 : 0,
+            'has_denied' => 0,
+            'ammount' => $amount,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+}

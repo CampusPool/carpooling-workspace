@@ -1,0 +1,228 @@
+<?php
+
+namespace Tests\Unit\Transformers;
+
+use Carbon\Carbon;
+use STS\Models\User;
+use STS\Transformers\TripUserTransformer;
+use Tests\TestCase;
+
+class TripUserTransformerTest extends TestCase
+{
+    public function test_transform_returns_expected_trip_user_payload_shape_and_values(): void
+    {
+        $viewer = User::factory()->create();
+        $user = User::factory()->create([
+            'name' => 'Trip User',
+            'image' => 'trip-user.png',
+            'last_connection' => '2026-04-30 15:00:00',
+        ]);
+        $user->forceFill([
+            'description' => 'Profile description',
+            'private_note' => 'Private note',
+            'has_pin' => true,
+            'is_member' => false,
+            'monthly_donate' => true,
+            'do_not_alert_request_seat' => false,
+            'do_not_alert_accept_passenger' => true,
+            'do_not_alert_pending_rates' => false,
+            'do_not_alert_pricing' => true,
+            'autoaccept_requests' => false,
+            'driver_is_verified' => true,
+            'driver_data_docs' => json_encode(['dni' => true, 'license' => false]),
+            'conversation_opened_count' => 3,
+            'conversation_answered_count' => 2,
+            'answer_delay_sum' => 120,
+            'identity_validated_at' => Carbon::parse('2026-04-29 09:30:00'),
+        ])->saveQuietly();
+
+        $payload = (new TripUserTransformer($viewer))->transform($user->fresh());
+
+        $this->assertSame([
+            'id',
+            'name',
+            'first_name',
+            'descripcion',
+            'private_note',
+            'image',
+            'positive_ratings',
+            'negative_ratings',
+            'neutral_ratings',
+            'last_connection',
+            'accounts',
+            'has_pin',
+            'is_member',
+            'monthly_donate',
+            'do_not_alert_request_seat',
+            'do_not_alert_accept_passenger',
+            'do_not_alert_pending_rates',
+            'do_not_alert_pricing',
+            'autoaccept_requests',
+            'driver_is_verified',
+            'driver_data_docs',
+            'conversation_opened_count',
+            'conversation_answered_count',
+            'answer_delay_sum',
+            'identity_validated_at',
+            'trips_count',
+            'created_at',
+        ], array_keys($payload));
+        $this->assertSame($user->id, $payload['id']);
+        $this->assertSame('Trip User', $payload['name']);
+        $this->assertSame('Profile description', $payload['descripcion']);
+        $this->assertSame('Private note', $payload['private_note']);
+        $this->assertSame(0, $payload['positive_ratings']);
+        $this->assertSame(0, $payload['negative_ratings']);
+        $this->assertSame(0, $payload['neutral_ratings']);
+        $this->assertSame(3, $payload['conversation_opened_count']);
+        $this->assertSame(2, $payload['conversation_answered_count']);
+        $this->assertSame(120.0, $payload['answer_delay_sum']);
+        $this->assertSame('2026-04-30 15:00:00', $payload['last_connection']);
+        $this->assertSame('2026-04-29 09:30:00', $payload['identity_validated_at']);
+        $this->assertNotNull($payload['created_at']);
+        $this->assertIsObject($payload['driver_data_docs']);
+        $this->assertSame(0, $payload['trips_count']);
+        $this->assertNull($user->fresh()->trips_count);
+    }
+
+    public function test_transform_uses_cached_trips_count_when_present(): void
+    {
+        $viewer = User::factory()->create();
+        $user = User::factory()->create([
+            'last_connection' => '2026-04-30 16:00:00',
+            'trips_count' => 45,
+        ]);
+
+        $payload = (new TripUserTransformer($viewer))->transform($user->fresh());
+
+        $this->assertSame(45, $payload['trips_count']);
+    }
+
+    public function test_transform_returns_null_for_optional_docs_and_identity_date_when_absent(): void
+    {
+        $viewer = User::factory()->create();
+        $user = User::factory()->create([
+            'last_connection' => '2026-04-30 16:00:00',
+        ]);
+        $user->forceFill([
+            'driver_data_docs' => null,
+            'identity_validated_at' => null,
+        ])->saveQuietly();
+
+        $payload = (new TripUserTransformer($viewer))->transform($user->fresh());
+
+        $this->assertNull($payload['driver_data_docs']);
+        $this->assertNull($payload['identity_validated_at']);
+    }
+
+    public function test_missing_user_returns_placeholder_payload_with_usuario_ya_no_existe_name(): void
+    {
+        $viewer = User::factory()->create();
+
+        $payload = (new TripUserTransformer($viewer))->missingUser(99999);
+
+        $this->assertSame([
+            'id',
+            'name',
+            'first_name',
+            'descripcion',
+            'private_note',
+            'image',
+            'positive_ratings',
+            'negative_ratings',
+            'neutral_ratings',
+            'last_connection',
+            'accounts',
+            'has_pin',
+            'is_member',
+            'monthly_donate',
+            'do_not_alert_request_seat',
+            'do_not_alert_accept_passenger',
+            'do_not_alert_pending_rates',
+            'do_not_alert_pricing',
+            'autoaccept_requests',
+            'driver_is_verified',
+            'driver_data_docs',
+            'conversation_opened_count',
+            'conversation_answered_count',
+            'answer_delay_sum',
+            'identity_validated_at',
+            'trips_count',
+            'created_at',
+        ], array_keys($payload));
+        $this->assertSame(99999, $payload['id']);
+        $this->assertSame('Usuario ya no existe', $payload['name']);
+        $this->assertSame('', $payload['descripcion']);
+        $this->assertSame('', $payload['private_note']);
+        $this->assertSame('', $payload['image']);
+        $this->assertSame(0, $payload['positive_ratings']);
+        $this->assertSame(0, $payload['negative_ratings']);
+        $this->assertSame(0, $payload['neutral_ratings']);
+        $this->assertNull($payload['created_at']);
+        $this->assertSame('', $payload['last_connection']);
+        $this->assertNull($payload['accounts']);
+        $this->assertFalse($payload['has_pin']);
+        $this->assertFalse($payload['is_member']);
+        $this->assertFalse($payload['monthly_donate']);
+        $this->assertFalse($payload['do_not_alert_request_seat']);
+        $this->assertFalse($payload['do_not_alert_accept_passenger']);
+        $this->assertFalse($payload['do_not_alert_pending_rates']);
+        $this->assertFalse($payload['do_not_alert_pricing']);
+        $this->assertFalse($payload['autoaccept_requests']);
+        $this->assertFalse($payload['driver_is_verified']);
+        $this->assertNull($payload['driver_data_docs']);
+        $this->assertSame(0, $payload['conversation_opened_count']);
+        $this->assertSame(0, $payload['conversation_answered_count']);
+        $this->assertSame(0, $payload['answer_delay_sum']);
+        $this->assertNull($payload['identity_validated_at']);
+        $this->assertSame(0, $payload['trips_count']);
+    }
+
+    public function test_extract_first_name_uses_first_whitespace_token(): void
+    {
+        $this->assertSame('Juan', TripUserTransformer::extractFirstName('  Juan Pérez  '));
+        $this->assertSame('Ana', TripUserTransformer::extractFirstName('Ana'));
+        $this->assertSame('', TripUserTransformer::extractFirstName('   '));
+        $this->assertSame('', TripUserTransformer::extractFirstName(null));
+    }
+
+    public function test_transform_includes_first_name(): void
+    {
+        $viewer = User::factory()->create();
+        $user = User::factory()->create([
+            'name' => 'María López',
+            'last_connection' => '2026-04-30 15:00:00',
+        ]);
+
+        $payload = (new TripUserTransformer($viewer))->transform($user->fresh());
+
+        $this->assertSame('María', $payload['first_name']);
+    }
+
+    public function test_transform_public_returns_only_safe_fields(): void
+    {
+        $viewer = User::factory()->create();
+        $user = User::factory()->create([
+            'name' => 'Pedro Gómez',
+            'image' => 'p.png',
+            'last_connection' => '2026-04-30 15:00:00',
+        ]);
+
+        $payload = (new TripUserTransformer($viewer))->transformPublic($user->fresh());
+
+        $this->assertSame(['id', 'image', 'first_name'], array_keys($payload));
+        $this->assertSame($user->id, $payload['id']);
+        $this->assertSame('p.png', $payload['image']);
+        $this->assertSame('Pedro', $payload['first_name']);
+        $this->assertArrayNotHasKey('name', $payload);
+        $this->assertArrayNotHasKey('email', $payload);
+        $this->assertArrayNotHasKey('private_note', $payload);
+    }
+
+    public function test_missing_user_includes_first_name_token(): void
+    {
+        $payload = (new TripUserTransformer(User::factory()->create()))->missingUser(99);
+
+        $this->assertSame('Usuario', $payload['first_name']);
+    }
+}

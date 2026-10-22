@@ -1,0 +1,18 @@
+# Financial core — local implementation
+
+`PaymentService` uses the same MySQL, trips and passenger bookings as the lifecycle extension. There is no public provider callback/charge/payout write API or provider dispatcher. A separate authenticated cash-receipt API records participant claims without posting provider money; payment-history routes are read-only. The service is an internal server boundary; its capture and beneficiary arguments must never come from client-controlled success flags.
+
+Implemented methods:
+
+- `snapshotFare`: one immutable INR minor-unit fare per accepted booking, with explicit gross, commission and driver allocation. This stores a trusted server quote; it is not a pricing engine or tax policy.
+- `createPaymentAttempt`: binds provider, test/live environment and case-sensitive order reference to the booking/fare. Collection closes after start/expiry/cancellation. Cash cannot enter this path, and an existing cash receipt blocks provider checkout. Legacy non-startable trip states also close collection.
+- `ingestCapturedPayment`: consumes verified facts, locks trip → booking → attempt, validates the current mapping, records event identity/hash and one balanced capture posting. Duplicate events and reordered fields do not credit twice. Captured payment references are immutable.
+- `registerBeneficiary`: internal trusted provider-adapter assertion of a verified beneficiary and delayed-settlement capability. Tests populate synthetic records; this is not evidence of actual account verification. No HTTP endpoint exposes these flags.
+- `enqueueRelease`: requires completed lifecycle, an accepted/alighted passenger, a matching rider confirmation linked to the actual alight event, captured funds, no active block and a beneficiary verified for the same provider/environment. It allocates gross funds to driver payable plus explicit platform fee, freezes the beneficiary reference and inserts one durable outbox command. It does not send money.
+- `blockRefundOrDispute`: records a blocking reason, including on a cancelled booking, and marks pending payout commands/allocations blocked. Existing postings remain unchanged. Provider refunds/reversals are not implemented.
+
+A late capture for a known cancelled/expired booking remains recorded and blocked for reconciliation; it cannot restore a seat. An excess capture on another already-paid attempt is rejected for manual reconciliation. A durable excess-payment inbox and recovery/refund worker are still needed before enabling provider callbacks. Zero driver payouts are rejected.
+
+`Providers/RazorpayCaptureVerifier` verifies raw-body HMAC, configured merchant account, captured UPI event, INR and exact integer amounts. Environment comes from secret configuration; it must use separate secrets/configuration for test and live. Refunded/transferred amounts must be present as integer zero, otherwise the event requires reconciliation. It maps minimal financial facts and does not persist raw personal data. The test signatures are locally generated fixtures, not provider sandbox traffic. Official schema/validation references are in `docs/PAYMENTS.md` at the project root.
+
+Ledger postings are append-only through this service API; the database role is not yet restricted to prevent arbitrary SQL mutation. This is not tamper-proof financial storage. Provider fees/taxes, partial refunds, reversal/chargeback postings, beneficiary revocation, dispatch-time rechecks, uncertain external commands, account activation, settlement webhooks and operational reconciliation remain required. A release/outbox entry is neither a provider transfer nor bank credit. Live dispatch stays absent.

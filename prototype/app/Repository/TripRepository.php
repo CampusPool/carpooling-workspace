@@ -1,0 +1,1125 @@
+<?php
+
+namespace STS\Repository;
+
+use Carbon\Carbon;
+use DB;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Http;
+use STS\Helpers\OngoingTripHelper;
+use STS\Helpers\SelladoEmptyTripCredit;
+use STS\Helpers\TripPriceHelper;
+use STS\Helpers\TripPricingBreakdown;
+use STS\Jobs\CheckTripContributionWithLlm;
+use STS\Models\NodeGeo;
+use STS\Models\Passenger;
+use STS\Models\PaymentAttempt;
+use STS\Models\Route;
+use STS\Models\RouteCache;
+use STS\Models\Trip;
+use STS\Models\TripPoint;
+use STS\Models\User;
+use STS\Services\GeoService;
+use STS\Services\MapboxDirectionsRouteService;
+use STS\Services\MercadoPagoService;
+
+class TripRepository
+{
+    private $paidRegions;
+
+    private $geoService;
+
+    private $mercadoPagoService;
+
+    private $mapboxDirectionsRouteService;
+
+    public function __construct(
+        GeoService $geoService,
+        MercadoPagoService $mercadoPagoService,
+        MapboxDirectionsRouteService $mapboxDirectionsRouteService
+    ) {
+        $this->geoService = $geoService;
+        $this->paidRegions = $this->geoService->getPaidRegions();
+        $this->mercadoPagoService = $mercadoPagoService;
+        $this->mapboxDirectionsRouteService = $mapboxDirectionsRouteService;
+    }
+
+    private function getPotentialNode($point)
+    {
+        $minLat = $point['lat'] - 0.05;
+        $maxLat = $point['lat'] + 0.05;
+        $minLng = $point['lng'] - 0.1;
+        $maxLng = $point['lng'] + 0.1;
+
+        return NodeGeo::whereBetween('lat', [$minLat, $maxLat])
+            ->whereBetween('lng', [$minLng, $maxLng])
+            ->first();
+    }
+
+    public function generateTripFriendVisibility($trip)
+    {
+        $privacy = (int) $trip->friendship_type_id;
+        if ($privacy < Trip::PRIVACY_PUBLIC) {
+            if ($privacy === Trip::PRIVACY_FOF) {
+                // friend of friends
+                $query = 'INSERT INTO user_visibility_trip
+                            (SELECT f.uid2, t.id
+                                FROM trips t
+                                INNER JOIN friends f ON t.user_id = f.uid1 AND f.state = 1
+                                WHERE t.friendship_type_id = 1
+                                    AND t.id = ?
+                            )
+                            UNION
+                            (SELECT f2.uid2, t.id
+                                FROM trips t
+                                INNER JOIN friends f ON t.user_id = f.uid1 AND f.state = 1
+                                INNER JOIN friends f2 ON f.uid2 = f2.uid1 AND f2.state = 1
+                                WHERE t.friendship_type_id = 1
+                                    AND t.id = ?
+                            )
+                ';
+                DB::insert($query, [$trip->id, $trip->id]);
+            } elseif ($privacy === Trip::PRIVACY_FRIENDS) {
+                // only friends
+                $query = 'INSERT INTO user_visibility_trip
+                                SELECT f.uid2, t.id
+                                    FROM trips t
+                                    INNER JOIN friends f ON t.user_id = f.uid1 AND f.state = 1
+                                    WHERE t.friendship_type_id = 0
+                                        AND t.id = ?
+                ';
+                DB::insert($query, [$trip->id]);
+            }
+        }
+    }
+
+    public function create(array $data)
+    {
+        $points = $data['points'];
+        unset($data['points']);
+
+        // Get trip info for price calculations and route data
+        $tripInfo = $this->getTripInfo($points);
+
+        $data = $this->capSeatPriceAtMaximum($data, $tripInfo, $data['rear_max_two_passengers'] ?? false);
+
+        $trip = Trip::create($data);
+
+        $this->storeTripInfoPrices($trip, $tripInfo);
+
+        $this->addPoints($trip, $points);
+
+        $this->generateTripPath($trip);
+
+        $allPointsToCheck = array_map(fn ($p) => [$p['lat'], $p['lng']], $points);
+        $routeNeedsPayment = $this->geoService->doStopsRequireSellado($allPointsToCheck);
+
+        $this->maybeRequireSelladoPayment($trip, $routeNeedsPayment);
+
+        // obtener ruta o crear
+        $routeIds = [];
+        for ($i = 1; $i < count($points); $i++) {
+            $origin = is_array($points[$i - 1]['json_address']) ? (object) $points[$i - 1]['json_address'] : json_decode($points[$i - 1]['json_address']);
+            $destiny = is_array($points[$i]['json_address']) ? (object) $points[$i]['json_address'] : json_decode($points[$i]['json_address']);
+            if (! isset($origin->id) || ! isset($destiny->id)) {
+                $origin = $this->getPotentialNode($points[$i - 1]);
+                $destiny = $this->getPotentialNode($points[$i]);
+            }
+            if (isset($origin->id) && $origin->id > 0 && isset($destiny->id) && $destiny->id > 0) {
+                $route = Route::where('from_id', $origin->id)->where('to_id', $destiny->id)->first();
+                if (! $route) {
+                    $route = new Route;
+                    $route->from_id = $origin->id;
+                    $route->to_id = $destiny->id;
+                    $route->processed = false;
+                    $route->save();
+
+                    $nodes = [$origin->id, $destiny->id];
+                    $route->nodes()->sync($nodes);
+                }
+                $routeIds[] = $route->id;
+            }
+        }
+        if (count($routeIds)) {
+            $trip->routes()->sync($routeIds);
+        }
+
+        $this->generateTripFriendVisibility($trip);
+
+        if (trim((string) $trip->description) !== '') {
+            $this->dispatchContributionCheck($trip);
+        }
+
+        // TODO: check if trip.needs_payment (temp flag), and if total_trips_created > 2, we need to pay
+        // for this trip (origin and destination in paid cities),
+        // if so, mark trip as awaiting_payment, create payment_id and return it to the frontend so it can redirect
+        return $trip;
+    }
+
+    public function update($trip, array $data)
+    {
+        $descriptionBefore = (string) $trip->description;
+        $seatPriceCentsBefore = (int) $trip->seat_price_cents;
+        $maximumTripPriceCentsBefore = $trip->maximum_trip_price_cents;
+        $rearMaxTwoPassengersBefore = (bool) $trip->rear_max_two_passengers;
+
+        $points = null;
+        if (isset($data['points'])) {
+            $points = $data['points'];
+            unset($data['points']);
+        }
+
+        // Store old points to compare if route changed from non-paid to paid
+        $oldPoints = null;
+        $oldRouteNeedsPayment = false;
+        if ($points) {
+            $oldPoints = $trip->points()->orderBy('id')->get();
+            if ($oldPoints->count() >= 2) {
+                $oldPointsToCheck = $oldPoints->map(fn ($p) => [$p->lat, $p->lng])->values()->all();
+                $oldRouteNeedsPayment = $this->geoService->doStopsRequireSellado($oldPointsToCheck);
+            }
+        }
+
+        // Get trip info for price calculations and route data if points are being updated
+        $tripInfo = null;
+        if ($points) {
+            $tripInfo = $this->getTripInfo($points);
+
+            $data = $this->capSeatPriceAtMaximum(
+                $data,
+                $tripInfo,
+                $data['rear_max_two_passengers'] ?? $trip->rear_max_two_passengers
+            );
+        }
+
+        $trip = DB::transaction(function () use ($trip, $data, $points, $tripInfo, $oldRouteNeedsPayment) {
+            $trip->update($data);
+
+            if ($tripInfo) {
+                $this->storeTripInfoPrices($trip, $tripInfo);
+            }
+
+            if ($points) {
+                $this->deletePoints($trip);
+                $this->addPoints($trip, $points);
+                $this->generateTripPath($trip);
+
+                // Check if the updated route needs payment (2+ stops in paid zones)
+                $allPointsToCheck = array_map(fn ($p) => [$p['lat'], $p['lng']], $points);
+                $routeNeedsPayment = $this->geoService->doStopsRequireSellado($allPointsToCheck);
+
+                $tripsCreatedByUser = Trip::where('user_id', $trip->user_id)->count();
+
+                // Check if route changed from non-paid to paid route and trip wasn't already awaiting payment
+                if (config('carpoolear.module_trip_creation_payment_enabled') &&
+                    $routeNeedsPayment &&
+                    ! $oldRouteNeedsPayment &&
+                    $tripsCreatedByUser >= config('carpoolear.module_trip_creation_payment_trips_threshold') &&
+                    $trip->state !== Trip::STATE_AWAITING_PAYMENT) {
+
+                    // User already paid Sellado for this trip (check payment record, not just state + payment_id)
+                    $selladoAlreadyPaid = PaymentAttempt::where('trip_id', $trip->id)
+                        ->where('payment_status', PaymentAttempt::STATUS_COMPLETED)
+                        ->exists();
+
+                    if ($selladoAlreadyPaid) {
+                        // Just mark that route needs Sellado again; do not charge again
+                        $trip->needs_sellado = true;
+                        $trip->save();
+                    } else {
+                        $trip->state = Trip::STATE_AWAITING_PAYMENT;
+
+                        $paymentUrl = null;
+                        // Only create payment preference if one doesn't exist
+                        if (! $trip->payment_id) {
+                            // Create MercadoPago payment preference
+                            $preference = $this->mercadoPagoService->createPaymentPreferenceForSellado($trip, config('carpoolear.module_trip_creation_payment_amount_cents'));
+                            $trip->payment_id = $preference->id;
+                            $paymentUrl = $preference->init_point;
+                        }
+
+                        $trip->needs_sellado = true;
+                        $trip->save();
+
+                        if ($paymentUrl !== null) {
+                            $trip->payment_url = $paymentUrl;
+                        }
+                    }
+                } elseif (config('carpoolear.module_trip_creation_payment_enabled') && ! $routeNeedsPayment) {
+                    // Route was edited so it no longer needs Sellado (fewer than 2 points in paid zone)
+                    $trip->needs_sellado = false;
+                    $paymentStates = [Trip::STATE_AWAITING_PAYMENT, Trip::STATE_PENDING_PAYMENT, Trip::STATE_PAYMENT_FAILED];
+                    $wasInPaymentState = in_array($trip->state, $paymentStates);
+                    if ($wasInPaymentState) {
+                        $trip->payment_id = null;
+                        $trip->state = Trip::STATE_READY;
+                    }
+                    $trip->save();
+                    if ($wasInPaymentState) {
+                        $trip->payment_url = null;
+                    }
+                }
+            }
+
+            return $trip;
+        });
+
+        if (
+            (string) $trip->description !== $descriptionBefore
+            || (int) $trip->seat_price_cents !== $seatPriceCentsBefore
+            || $trip->maximum_trip_price_cents !== $maximumTripPriceCentsBefore
+            || (bool) $trip->rear_max_two_passengers !== $rearMaxTwoPassengersBefore
+        ) {
+            $this->dispatchContributionCheck($trip);
+        }
+
+        return $trip;
+    }
+
+    /**
+     * Cap seat_price_cents at the maximum allowed seat price from trip info
+     * (only when the max price module is enabled).
+     */
+    private function capSeatPriceAtMaximum(array $data, array $tripInfo, $rearMaxTwoPassengers): array
+    {
+        if (! isset($data['seat_price_cents']) || ! config('carpoolear.module_max_price_enabled')) {
+            return $data;
+        }
+
+        if (! $tripInfo['status'] || ! isset($tripInfo['data']['maximum_trip_price_cents'])) {
+            return $data;
+        }
+
+        $maximumSeatPriceCents = TripPriceHelper::seatPriceCentsFromTripPriceCents(
+            (int) $tripInfo['data']['maximum_trip_price_cents'],
+            $rearMaxTwoPassengers
+        );
+
+        if ($data['seat_price_cents'] > $maximumSeatPriceCents) {
+            $data['seat_price_cents'] = $maximumSeatPriceCents;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Persist the recommended and maximum allowed trip prices from trip info.
+     * The maximum is what the queued LLM contribution check compares against.
+     */
+    private function storeTripInfoPrices(Trip $trip, array $tripInfo): void
+    {
+        if (! $tripInfo['status']) {
+            return;
+        }
+
+        $changed = false;
+
+        if (isset($tripInfo['data']['recommended_trip_price_cents'])) {
+            $trip->recommended_trip_price_cents = $tripInfo['data']['recommended_trip_price_cents'];
+            $changed = true;
+        }
+
+        if (isset($tripInfo['data']['maximum_trip_price_cents'])) {
+            $trip->maximum_trip_price_cents = (int) $tripInfo['data']['maximum_trip_price_cents'];
+            $changed = true;
+        }
+
+        if ($changed) {
+            $trip->save();
+        }
+    }
+
+    /**
+     * Queue the LLM review of the description (after the trip is saved and
+     * outside any transaction). It must never block or fail the save.
+     */
+    private function dispatchContributionCheck(Trip $trip): void
+    {
+        try {
+            Bus::dispatch(new CheckTripContributionWithLlm((int) $trip->id));
+        } catch (\Throwable $e) {
+            \Log::warning('Trip contribution LLM check could not be queued', [
+                'trip_id' => $trip->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    public function generateTripPath($trip)
+    {
+        $nodeIds = $trip->points()
+            ->orderBy('id')
+            ->get()
+            ->map(fn ($point) => ((object) $point->json_address)->id ?? null)
+            ->filter(fn ($id) => $id > 0)
+            ->values();
+
+        if ($nodeIds->isNotEmpty()) {
+            $trip->path = '.'.$nodeIds->implode('.').'.';
+            $trip->save();
+        }
+
+        return $trip->path;
+    }
+
+    public function show($user, $id)
+    {
+        if ($user->is_admin) {
+            $trip = Trip::with(['user', 'points', 'car', 'passenger', 'ratings'])->withTrashed()->whereId($id)->first();
+
+            return $trip;
+        } else {
+            return Trip::with(['user', 'points'])->whereId($id)->first();
+        }
+    }
+
+    public function index($criterias, $withs = [])
+    {
+        $trips = Trip::orderBy('trip_date');
+        foreach ($criterias as $item) {
+            $first = $item['key'];
+            if (strpos($first, '(')) {
+                $first = DB::Raw($first);
+            }
+            if (isset($item['op'])) {
+                $trips->where($first, $item['op'], $item['value']);
+            } else {
+                $trips->where($first, $item['value']);
+            }
+        }
+        if ($withs) {
+            $trips->with($withs);
+        }
+
+        return $trips->get();
+    }
+
+    public function getTrips($user, $userId, $asDriver)
+    {
+        // Weekly schedule trips never expire, so include them regardless of trip_date
+        $trips = Trip::query();
+        $this->filterActiveTrips($trips);
+
+        if ($asDriver) {
+            $trips->where('user_id', $userId);
+        } else {
+            $this->applyAcceptedPassengerFilter($trips, $userId);
+        }
+
+        $trips->select('trips.*');
+        $trips->orderBy('trip_date');
+        $trips->with(['user', 'points', 'passengerAccepted', 'passengerAccepted.user', 'car']);
+
+        return $trips->get();
+    }
+
+    public function getOldTrips($user, $userId, $asDriver)
+    {
+        // Weekly schedule trips never expire, so exclude them from old trips
+        $trips = Trip::where('trip_date', '<', Carbon::Now());
+        $trips->where('weekly_schedule', '=', 0);
+
+        if ($asDriver) {
+            $trips->where('user_id', $userId);
+        } else {
+            $this->applyAcceptedPassengerFilter($trips, $userId);
+        }
+
+        $trips->select('trips.*');
+        $trips->orderBy('trip_date');
+        $trips->with(['user', 'points', 'passengerAccepted', 'passengerAccepted.user', 'car']);
+
+        return $trips->get();
+    }
+
+    public function getOngoingTrip(User $user): ?Trip
+    {
+        $now = Carbon::now();
+        $candidateStart = $now->copy()->subDay();
+        $candidateEnd = $now->copy()->addHour();
+
+        $driverTrips = Trip::query()
+            ->where('user_id', $user->id)
+            ->where('weekly_schedule', 0)
+            ->whereBetween('trip_date', [$candidateStart, $candidateEnd])
+            ->with(['user', 'points', 'passengerAccepted', 'passengerAccepted.user', 'car'])
+            ->get();
+
+        $passengerTrips = Trip::query()
+            ->where('weekly_schedule', 0)
+            ->whereBetween('trip_date', [$candidateStart, $candidateEnd]);
+        $this->applyAcceptedPassengerFilter($passengerTrips, $user->id);
+        $passengerTrips->select('trips.*');
+        $passengerTrips = $passengerTrips
+            ->with(['user', 'points', 'passengerAccepted', 'passengerAccepted.user', 'car'])
+            ->get();
+
+        $candidates = $driverTrips
+            ->concat($passengerTrips)
+            ->unique('id')
+            ->filter(fn (Trip $trip) => OngoingTripHelper::isWithinOngoingTripWindow(
+                $now,
+                $trip->trip_date,
+                $trip->estimated_time
+            ));
+
+        if ($candidates->isEmpty()) {
+            return null;
+        }
+
+        return $candidates
+            ->sortBy(fn (Trip $trip) => $trip->trip_date->timestamp)
+            ->first();
+    }
+
+    public function search($user, $data)
+    {
+
+        $trips = Trip::query()->with(['routes']);
+        if (isset($data['is_passenger'])) {
+            $trips->where('is_passenger', parse_boolean($data['is_passenger']));
+        }
+        if (isset($data['is_admin']) && strval($data['is_admin']) === 'true') {
+            $trips->withTrashed();
+        }
+
+        if (! empty($data['from_date']) || ! empty($data['to_date'])) {
+            if (! empty($data['from_date'])) {
+                $date_from = parse_date($data['from_date'])->startOfDay();
+
+                $trips = $trips->where('trip_date', '>=', date_to_string($date_from, 'Y-m-d H:i:s'));
+                $trips->orderBy('trip_date');
+            }
+            if (! empty($data['to_date'])) {
+                $date_to = parse_date($data['to_date'])->endOfDay();
+
+                $trips->where('trip_date', '<=', date_to_string($date_to, 'Y-m-d H:i:s'));
+                $trips->orderBy('trip_date');
+            }
+        } else {
+            if (isset($data['date'])) {
+                if (isset($data['strict'])) {
+                    $trips = $trips->where(DB::Raw('DATE(trip_date)'), $data['date']);
+                    $trips->orderBy('trip_date');
+                } else {
+                    $date_search = parse_date($data['date'])->startOfDay();
+                    $from = $date_search->copy()->subDays(3);
+                    $to = $date_search->copy()->addDays(3);
+
+                    $now = Carbon::now('America/Argentina/Buenos_Aires');
+                    if ($from->lte($now)) {
+                        $from = $now;
+                    }
+
+                    // Calculate day of week for the search date (1=Monday, 7=Sunday)
+                    $dayOfWeek = $date_search->dayOfWeekIso;
+                    $dayBit = pow(2, $dayOfWeek - 1); // Monday=1, Tuesday=2, Wednesday=4, ..., Sunday=64
+
+                    $trips->where(function ($query) use ($from, $to, $dayBit) {
+                        // Regular trips within date range
+                        $query->where('trip_date', '>=', date_to_string($from, 'Y-m-d H:i:s'))
+                            ->where('trip_date', '<=', date_to_string($to, 'Y-m-d H:i:s'))
+                            // Also include weekly schedule trips that run on this day of the week
+                            ->orWhere(function ($query) use ($dayBit) {
+                                $query->where('weekly_schedule', '>', 0)
+                                    ->whereRaw('(weekly_schedule & ?) > 0', [$dayBit]);
+                            });
+                    });
+
+                    $trips->orderBy(DB::Raw("IF(ABS(DATEDIFF(DATE(trip_date), '".date_to_string($date_search)."' )) = 0, 0, 1)"));
+                    $this->applyClubCarpoolearDriverPriorityOrdering($trips);
+                }
+            } elseif (isset($data['weekly_schedule'])) {
+                // Search by weekly schedule flag using bitwise AND operation
+                $weeklyScheduleFlag = intval($data['weekly_schedule']);
+                $trips->whereRaw('(weekly_schedule & ?) > 0', [$weeklyScheduleFlag]);
+                $trips->orderBy('trip_date');
+            } else {
+                if (! isset($data['history'])) {
+                    // Include active trips OR weekly schedule trips
+                    $this->filterActiveTrips($trips);
+                    $trips->orderBy('trip_date');
+                }
+            }
+        }
+        if (isset($data['user_id'])) {
+            $trips->whereUserId($data['user_id']);
+        }
+
+        $this->applyUnpaidSelladoVisibilityFilter($trips, $user);
+
+        if ($user && ! $user->is_admin) {
+            $trips->where(function ($q) use ($user) {
+                // only show trips that are ready (paid by driver) or have no state
+                $q->where(function ($q) use ($user) {
+                    $q->where('state', '=', Trip::STATE_READY)
+                        ->orWhere('state', '=', Trip::STATE_PAID)
+                        ->orWhereNull('state')
+                        ->orWhere('user_id', $user->id);
+                });
+
+                $q->where(function ($q) use ($user) {
+                    $q->whereUserId($user->id)
+                        ->orWhere(function ($q) use ($user) {
+                            $q->whereFriendshipTypeId(Trip::PRIVACY_PUBLIC)
+                                ->orWhere(function ($q) use ($user) {
+                                    $q->where('friendship_type_id', '<', Trip::PRIVACY_PUBLIC)
+                                        ->whereHas('userVisibility', function ($q) use ($user) {
+                                            $q->where('user_id', $user->id);
+                                        });
+                                });
+                        });
+                });
+            });
+        }
+        if (isset($data['origin_id']) && isset($data['destination_id'])) {
+            $fromId = (int) $data['origin_id'];
+            $toId = (int) $data['destination_id'];
+
+            $trips->where(function ($query) use ($fromId, $toId) {
+                $query->where('path', 'LIKE', "%.{$fromId}.{$toId}.%")
+                    ->orWhere('path', 'LIKE', "%.{$fromId}.%.{$toId}.%");
+            });
+        } else {
+            if (isset($data['origin_id'])) {
+
+                $trips->whereHas('routes', function ($q) use ($data) {
+                    $q->where('routes.from_id', $data['origin_id']);
+                });
+            } else {
+                if (isset($data['origin_lat']) && isset($data['origin_lng'])) {
+                    $distance = 1000.0;
+                    if (isset($data['origin_radio'])) {
+                        $distance = floatval($data['origin_radio']);
+                    }
+                    $this->whereLocation($trips, $data['origin_lat'], $data['origin_lng'], 'origin', $distance);
+                }
+            }
+            if (isset($data['destination_id'])) {
+                $trips->whereHas('routes', function ($q) use ($data) {
+                    $q->where('routes.to_id', $data['destination_id']);
+                });
+            } else {
+                if (isset($data['destination_lat']) && isset($data['destination_lng'])) {
+                    $distance = 1000.0;
+                    if (isset($data['destination_radio'])) {
+                        $distance = floatval($data['destination_radio']);
+                    }
+                    $this->whereLocation($trips, $data['destination_lat'], $data['destination_lng'], 'destination', $distance);
+                }
+            }
+        }
+
+        $this->applyAllowPreferenceFilters($trips, $data);
+
+        if (isset($data['hide_carpooleado']) && parse_boolean($data['hide_carpooleado'])) {
+            $this->excludeCarpooleadoTrips($trips);
+        }
+
+        if (! (isset($data['date']) && ! isset($data['strict']) && empty($data['from_date']) && empty($data['to_date']))) {
+            $this->applyClubCarpoolearDriverPriorityOrdering($trips);
+        }
+
+        $trips->with([
+            'user',
+            'user.accounts',
+            'points',
+            'passenger',
+            'passengerAccepted',
+            'passengerAccepted.user',
+            'car',
+            'ratings',
+        ]);
+
+        $pageNumber = isset($data['page']) ? $data['page'] : null;
+        $pageSize = isset($data['page_size']) ? $data['page_size'] : null;
+
+        // DB::enableQueryLog();
+        $pagination = make_pagination($trips, $pageNumber, $pageSize);
+
+        // $pagination = $trips->take(7)->get();
+        // \Log::info(DB::getQueryLog());
+        return $pagination;
+    }
+
+    private function applyClubCarpoolearDriverPriorityOrdering($trips): void
+    {
+        $trips->leftJoin('users as club_trip_drivers', 'trips.user_id', '=', 'club_trip_drivers.id');
+        $trips->select('trips.*');
+        $trips->orderByRaw("DATE_FORMAT(trips.trip_date, '%Y-%m-%d %H:00:00')");
+        $trips->orderByRaw('CASE WHEN COALESCE(club_trip_drivers.monthly_donate, 0) = 1 THEN 0 ELSE 1 END');
+        $trips->orderBy('trips.trip_date');
+    }
+
+    private function whereLocation($trips, $lat, $lng, $way, $distance = 1000.0)
+    {
+        $deg2radMultiplier = M_PI / 180.0;
+        $latd = $lat * $deg2radMultiplier;
+        $lngd = $lng * $deg2radMultiplier;
+        $sin_lat = str_replace(',', '.', sin($latd));
+        $cos_lat = str_replace(',', '.', cos($latd));
+        $sin_lng = str_replace(',', '.', sin($lngd));
+        $cos_lng = str_replace(',', '.', cos($lngd));
+
+        $distance = max($distance, 1000.0);
+        $dist = cos(($distance / 1000.0) / 6371.0);
+        $dist = str_replace(',', '.', $dist);
+
+        $trips->whereHas('points', function ($q) use ($way, $sin_lat, $sin_lng, $cos_lat, $cos_lng, $dist) {
+            if ($way === 'origin') {
+                $q->where('id', DB::Raw('(select min(`id`) from trips_points where trip_id = `trips`.`id`)'));
+            }
+            if ($way === 'destination') {
+                $q->where('id', DB::Raw('(select max(`id`) from trips_points where trip_id = `trips`.`id`)'));
+            }
+            $q->whereRaw('sin_lat * '.$sin_lat.' + cos_lat * '.$cos_lat.' *  (cos_lng * '.$cos_lng.' + sin_lng * '.$sin_lng.') > '.$dist);
+        });
+    }
+
+    private function applyUnpaidSelladoVisibilityFilter($trips, $user): void
+    {
+        // In the list, unpaid sellado trips are visible only to their owner (including for admins)
+        $trips->where(function ($q) use ($user) {
+            if ($user) {
+                $q->where('user_id', $user->id);
+            }
+            $q->orWhere('needs_sellado', '=', 0)
+                ->orWhereNull('needs_sellado')
+                ->orWhere('state', '=', Trip::STATE_READY);
+        });
+    }
+
+    private function applyAllowPreferenceFilters($trips, array $data): void
+    {
+        foreach (['allow_animals', 'allow_smoking', 'allow_kids'] as $allowField) {
+            if (isset($data[$allowField])) {
+                $trips->where($allowField, parse_boolean($data[$allowField]) ? 1 : 0);
+            }
+        }
+    }
+
+    private function excludeCarpooleadoTrips($trips): void
+    {
+        $trips->whereRaw(
+            'trips.total_seats > (
+                SELECT COUNT(*)
+                FROM trip_passengers
+                WHERE trip_passengers.trip_id = trips.id
+                AND trip_passengers.request_state = ?
+                AND trip_passengers.user_id <> trips.user_id
+            )',
+            [Passenger::STATE_ACCEPTED]
+        );
+    }
+
+    private function applyAcceptedPassengerFilter($query, $userId): void
+    {
+        $query->join('trip_passengers', 'trips.id', '=', 'trip_passengers.trip_id');
+        $query->whereNull('trips.deleted_at');
+        $query->where('trip_passengers.user_id', $userId);
+        $query->where('trip_passengers.request_state', Passenger::STATE_ACCEPTED);
+    }
+
+    private function filterActiveTrips($query)
+    {
+        // Include active trips OR weekly schedule trips
+        $query->where(function ($q) {
+            $q->where('trip_date', '>=', Carbon::Now())
+                ->orWhere('weekly_schedule', '>', 0);
+        });
+    }
+
+    public function delete($trip)
+    {
+        return $trip->delete();
+    }
+
+    public function addPoints($trip, $points)
+    {
+        foreach ($points as $point) {
+            $p = new TripPoint;
+            if (isset($point['address'])) {
+                $p->address = $point['address'];
+            } else {
+                try {
+                    if (is_array($point['json_address'])) {
+                        $p->address = $point['json_address']['ciudad'];
+                    } else {
+                        $json = json_decode($point['json_address']);
+                        $p->address = $json->ciudad;
+                    }
+                } catch (\Throwable $ex) {
+                    $p->address = '';
+                }
+            }
+            $p->json_address = $point['json_address'];
+            $p->lat = $point['lat'];
+            $p->lng = $point['lng'];
+            $trip->points()->save($p);
+        }
+    }
+
+    public function shareTrip($user, $other)
+    {
+        $trip = Trip::with(['user']);
+        $trip = $trip->where('user_id', '=', $user->id);
+        // Include weekly schedule trips since they never expire
+        $this->filterActiveTrips($trip);
+        $trip = $trip->whereHas('passengerAccepted', function ($query) use ($other) {
+            $query->where('user_id', '=', $other->id);
+        });
+
+        if ($trip->first()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public function deletePoints($trip)
+    {
+        $trip->points()->delete();
+    }
+
+    public function simplePrice($distance)
+    {
+        return $distance * config('carpoolear.fuel_price') / 1000;
+    }
+
+    public function getTripInfo($points)
+    {
+        $hashedPoints = hash('sha256', json_encode($points));
+        $cacheBypass = (bool) config('carpoolear.trip_route_cache_bypass', false);
+
+        // Check cache first (unless bypass is enabled for debugging)
+        if (! $cacheBypass) {
+            $cachedRoute = RouteCache::where('hashed_points', $hashedPoints)
+                ->where(function ($query) {
+                    $query->whereNull('expires_at')
+                        ->orWhere('expires_at', '>', now());
+                })
+                ->first();
+
+            if ($cachedRoute) {
+                return $cachedRoute->route_data;
+            }
+        }
+
+        $coords = '';
+        foreach ($points as $point) {
+            if ($coords) {
+                $coords .= ';';
+            }
+            $coords .= $point['lng'].',';
+            $coords .= $point['lat'];
+        }
+
+        $osrmOutcome = $this->requestOsrmForTripInfoCoords($coords, $hashedPoints);
+
+        if ($osrmOutcome['status'] === 'route') {
+            $payload = $osrmOutcome['payload'];
+            $route = $payload['routes'][0];
+            $distanceInMeters = $route['distance'];
+            $duration = $route['duration'];
+
+            return $this->storeTripInfoSuccess(
+                $points,
+                $hashedPoints,
+                (float) $distanceInMeters,
+                (float) $duration,
+                'osrm'
+            );
+        }
+
+        if ($this->mapboxDirectionsRouteService->isEnabled()) {
+            $mapboxMetrics = $this->mapboxDirectionsRouteService->drivingDistanceAndDuration($points);
+            if ($mapboxMetrics !== null) {
+                return $this->storeTripInfoSuccess(
+                    $points,
+                    $hashedPoints,
+                    (float) $mapboxMetrics['distance'],
+                    (float) $mapboxMetrics['duration'],
+                    'mapbox_directions'
+                );
+            }
+        }
+
+        if ($osrmOutcome['status'] === 'osrm_unreachable') {
+            \Log::warning('[trip_route|getTripInfo] OSRM unreachable and Mapbox not available or failed', [
+                'hashed_points' => $hashedPoints,
+            ]);
+
+            return $this->routingServiceUnavailableResponse();
+        }
+
+        $failResponse = [
+            'status' => false,
+            'data' => null,
+            'message' => 'Route not found',
+        ];
+
+        if (! $cacheBypass) {
+            RouteCache::updateOrCreate(
+                ['hashed_points' => $hashedPoints],
+                [
+                    'points' => $points,
+                    'route_data' => $failResponse,
+                    'expires_at' => now()->addHour(),
+                ]
+            );
+        }
+
+        return $failResponse;
+    }
+
+    /**
+     * @return array{status: 'route', payload: array}|array{status: 'osrm_no_route', payload: array}|array{status: 'osrm_unreachable'}
+     */
+    private function requestOsrmForTripInfoCoords(string $coords, string $hashedPoints): array
+    {
+        $primary = rtrim((string) config('carpoolear.osrm_router_base_url', 'https://router.project-osrm.org'), '/');
+        $fallback = config('carpoolear.osrm_router_fallback_base_url')
+            ? rtrim((string) config('carpoolear.osrm_router_fallback_base_url'), '/')
+            : null;
+        $bases = array_values(array_unique(
+            array_filter([$primary, $fallback], static fn ($base) => $base !== null)
+        ));
+
+        $upstreamPath = '/route/v1/driving/'.$coords.'?overview=false&alternatives=true&steps=true';
+        $lastPayload = null;
+        $lastHttpStatus = null;
+
+        foreach ($bases as $base) {
+            if ($base === '') {
+                continue;
+            }
+            $url = $base.$upstreamPath;
+            try {
+                $response = Http::timeout(45)->get($url);
+            } catch (\Throwable $e) {
+                \Log::warning('[trip_route|getTripInfo] OSRM request exception', [
+                    'hashed_points' => $hashedPoints,
+                    'base' => $base,
+                    'coords_preview' => strlen($coords) > 120 ? substr($coords, 0, 120).'…' : $coords,
+                    'message' => $e->getMessage(),
+                    'exception' => $e::class,
+                ]);
+
+                continue;
+            }
+
+            $lastHttpStatus = $response->status();
+            $rawBodyPreview = strlen($body = $response->body()) > 500 ? substr($body, 0, 500).'…' : $body;
+
+            if ($response->serverError()) {
+                \Log::warning('[trip_route|getTripInfo] OSRM HTTP server error', [
+                    'hashed_points' => $hashedPoints,
+                    'base' => $base,
+                    'http_status' => $lastHttpStatus,
+                    'body_preview' => $rawBodyPreview,
+                ]);
+
+                continue;
+            }
+
+            $payload = $response->json();
+
+            if (! is_array($payload)) {
+                continue;
+            }
+
+            $lastPayload = $payload;
+
+            if ($response->successful()
+                && ($payload['code'] ?? null) === 'Ok'
+                && ! empty($payload['routes'])
+                && is_array($payload['routes'])) {
+                return ['status' => 'route', 'payload' => $payload];
+            }
+        }
+
+        if ($lastPayload !== null) {
+            return ['status' => 'osrm_no_route', 'payload' => $lastPayload];
+        }
+
+        return ['status' => 'osrm_unreachable'];
+    }
+
+    /**
+     * @return array{status: bool, data: array|null, message: string}
+     */
+    private function storeTripInfoSuccess(
+        array $points,
+        string $hashedPoints,
+        float $distanceInMeters,
+        float $duration,
+        string $provider
+    ): array {
+        $co2 = $distanceInMeters * 0.15;
+        $cacheBypass = (bool) config('carpoolear.trip_route_cache_bypass', false);
+
+        $allPointsToCheck = array_map(fn ($p) => [$p['lat'], $p['lng']], $points);
+        $routeNeedsPayment = $this->geoService->doStopsRequireSellado($allPointsToCheck);
+
+        $includesSellado = (bool) config('carpoolear.module_trip_creation_payment_enabled');
+        $selladoViajePrice = $includesSellado
+            ? (int) config('carpoolear.module_trip_creation_payment_amount_cents')
+            : 0;
+
+        $tollsVariancePercent = $this->resolveTollsVariancePercent($allPointsToCheck);
+        $maxPriceVariancePercent = config('carpoolear.module_max_price_price_variance_max_extra', 15);
+
+        $pricingBreakdown = TripPricingBreakdown::calculate(
+            $distanceInMeters,
+            (float) config('carpoolear.module_max_price_fuel_price'),
+            (float) config('carpoolear.module_max_price_kilometer_by_liter'),
+            $tollsVariancePercent,
+            $selladoViajePrice,
+            $includesSellado
+        );
+        $recommendedTripPriceCents = $pricingBreakdown['total_cents'];
+        $fuelAndTollsCents = $pricingBreakdown['fuel_cents'] + $pricingBreakdown['tolls_cents'];
+        $maximumTripPriceCents = (int) round($fuelAndTollsCents * (1 + $maxPriceVariancePercent / 100))
+            + $pricingBreakdown['sellado_cents'];
+
+        $data = [
+            'distance' => $distanceInMeters,
+            'duration' => $duration,
+            'co2' => $co2,
+            'route_needs_payment' => $routeNeedsPayment,
+            'recommended_trip_price_cents' => $recommendedTripPriceCents,
+            'maximum_trip_price_cents' => $maximumTripPriceCents,
+            'pricing_breakdown' => $pricingBreakdown,
+        ];
+
+        $response = [
+            'status' => true,
+            'data' => $data,
+            'message' => 'Route found',
+        ];
+
+        if (! $cacheBypass) {
+            $ttl = max(3600, (int) config('carpoolear.trip_route_cache_ttl_success_seconds', 31536000));
+            RouteCache::updateOrCreate(
+                ['hashed_points' => $hashedPoints],
+                [
+                    'points' => $points,
+                    'route_data' => $response,
+                    'expires_at' => now()->addSeconds($ttl),
+                ]
+            );
+
+        }
+
+        return $response;
+    }
+
+    /**
+     * @param  array<int, array{0: float, 1: float}>  $allPointsToCheck
+     */
+    private function resolveTollsVariancePercent(array $allPointsToCheck): float
+    {
+        if ($this->geoService->hasExactlyOneStopInCostaAtlanticaZone($allPointsToCheck)) {
+            return (float) config('carpoolear.module_max_price_price_variance_tolls_costa_atlantica', 25);
+        }
+
+        return (float) config('carpoolear.module_max_price_price_variance_tolls', 0);
+    }
+
+    private function routingServiceUnavailableResponse(): array
+    {
+        return [
+            'status' => false,
+            'data' => null,
+            'message' => trans('errors.routing_service_unavailable'),
+            'error_code' => 'routing_service_unavailable',
+        ];
+    }
+
+    private function maybeRequireSelladoPayment(Trip $trip, bool $routeNeedsPayment): void
+    {
+        if (! config('carpoolear.module_trip_creation_payment_enabled') || ! $routeNeedsPayment) {
+            return;
+        }
+
+        $tripsCreatedByUser = Trip::where('user_id', $trip->user_id)->count();
+        if ($tripsCreatedByUser < config('carpoolear.module_trip_creation_payment_trips_threshold')) {
+            return;
+        }
+
+        if (SelladoEmptyTripCredit::redeemOldestUnusedCredit($trip->user_id)) {
+            return;
+        }
+
+        $trip->state = Trip::STATE_AWAITING_PAYMENT;
+        $preference = $this->mercadoPagoService->createPaymentPreferenceForSellado(
+            $trip,
+            config('carpoolear.module_trip_creation_payment_amount_cents')
+        );
+        $trip->payment_id = $preference->id;
+        $trip->needs_sellado = true;
+        $trip->save();
+        $trip->payment_url = $preference->init_point;
+    }
+
+    public function selladoViaje($user)
+    {
+        // if user has created enough free trips, they have to pay for the next one
+        $tripsCreatedByUser = Trip::where('user_id', $user->id)->count();
+        $freeTripsAmount = config('carpoolear.module_trip_creation_payment_trips_threshold');
+        $userOverFreeLimit = $tripsCreatedByUser >= $freeTripsAmount;
+
+        return [
+            'trip_creation_payment_enabled' => config('carpoolear.module_trip_creation_payment_enabled'),
+            'free_trips_amount' => $freeTripsAmount,
+            'trips_created_by_user_amount' => $tripsCreatedByUser,
+            'user_over_free_limit' => $userOverFreeLimit,
+            'has_complimentary_sellado' => SelladoEmptyTripCredit::userHasUnusedCredit($user->id),
+        ];
+    }
+
+    public function getTripByTripPassenger($transaction_id)
+    {
+        return Passenger::where('id', $transaction_id)->first();
+    }
+
+    public function hideTrips($user)
+    {
+        $trips = Trip::where('user_id', $user->id);
+        $this->filterActiveTrips($trips);
+
+        return $trips->update(['deleted_at' => '2000-01-01']);
+    }
+
+    public function unhideTrips($user)
+    {
+        return Trip::onlyTrashed()
+            ->where('user_id', $user->id)
+            ->where('trip_date', '>=', Carbon::Now())
+            ->where('deleted_at', '2000-01-01 00:00:00')
+            ->update(['deleted_at' => null]);
+    }
+
+    public function getRecentTrips($userId, $hours)
+    {
+        return Trip::where('user_id', $userId)
+            ->where('created_at', '>=', Carbon::now()->subHours($hours))
+            ->get();
+    }
+
+    public function findDuplicateTrip($userId, $fromTown, $toTown, $tripDate, $isPassenger)
+    {
+        if (empty($tripDate)) {
+            return null;
+        }
+
+        return Trip::query()
+            ->where('user_id', $userId)
+            ->where('from_town', $fromTown)
+            ->where('to_town', $toTown)
+            ->where('trip_date', Carbon::parse($tripDate)->toDateTimeString())
+            ->where('is_passenger', (int) $isPassenger)
+            ->orderBy('id')
+            ->first();
+    }
+}

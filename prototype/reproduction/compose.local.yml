@@ -1,0 +1,7 @@
+services:
+  app:
+    ports:
+      - "127.0.0.1:18180:8000"
+networks:
+  appnet:
+    internal: false

@@ -1,0 +1,13 @@
+diff --git a/app/Repository/TripRepository.php b/app/Repository/TripRepository.php
+--- a/app/Repository/TripRepository.php
++++ b/app/Repository/TripRepository.php
+@@ -490,6 +490,9 @@
+         if (isset($data['is_admin']) && strval($data['is_admin']) === 'true') {
+             $trips->withTrashed();
+         }
++        if (\STS\Mobility\Trust\CohortPolicy::required()) {
++            \STS\Mobility\Trust\CohortPolicy::scopeOffers($trips);
++        }
+ 
+         if (! empty($data['from_date']) || ! empty($data['to_date'])) {
+             if (! empty($data['from_date'])) {

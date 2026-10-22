@@ -1,0 +1,194 @@
+diff --git a/app/Http/Controllers/Api/v1/UserController.php b/app/Http/Controllers/Api/v1/UserController.php
+index 4c3b4ca..603bb9c 100644
+--- a/app/Http/Controllers/Api/v1/UserController.php
++++ b/app/Http/Controllers/Api/v1/UserController.php
+@@ -57,7 +57,11 @@ public function __construct(
+ 
+     public function create(Request $request)
+     {
+-        $data = $request->all();
++        $data = $request->except([
++            'is_admin', 'active', 'activation_token', 'banned', 'driver_is_verified',
++            'identity_validated', 'identity_validated_at', 'identity_validation_type',
++            'identity_validation_rejected_at', 'identity_validation_reject_reason', 'validate_by_date',
++        ]);
+         if (config('carpoolear.module_validated_drivers', false)) {
+             $files = $request->file('driver_data_docs');
+             if (! empty($files)) {
+diff --git a/app/Repository/PassengersRepository.php b/app/Repository/PassengersRepository.php
+index 367b642..a8dda69 100755
+--- a/app/Repository/PassengersRepository.php
++++ b/app/Repository/PassengersRepository.php
+@@ -3,6 +3,7 @@
+ namespace STS\Repository;
+ 
+ use Carbon\Carbon;
++use Illuminate\Support\Facades\DB;
+ use STS\Models\Passenger;
+ use STS\Models\Trip;
+ 
+@@ -92,16 +93,19 @@ public function getPendingPaymentRequests($tripId, $user, $data)
+ 
+     public function newRequest($tripId, $user, $data = [])
+     {
+-        $newRequestData = [
+-            'trip_id' => $tripId,
+-            'user_id' => $user->id,
+-            'request_state' => Passenger::STATE_PENDING,
+-            'passenger_type' => Passenger::TYPE_PASAJERO,
+-        ];
+-
+-        $newRequest = Passenger::create($newRequestData);
++        return DB::transaction(function () use ($tripId, $user) {
++            $trip = Trip::query()->lockForUpdate()->find($tripId);
++            if (! $trip || $this->userHasActiveRequest($tripId, $user->id)) {
++                return null;
++            }
+ 
+-        return $newRequest;
++            return Passenger::create([
++                'trip_id' => $tripId,
++                'user_id' => $user->id,
++                'request_state' => Passenger::STATE_PENDING,
++                'passenger_type' => Passenger::TYPE_PASAJERO,
++            ]);
++        });
+     }
+ 
+     private function changeRequestState($tripId, $userId, $newState, $criterias, $canceledState = null)
+@@ -184,13 +188,19 @@ public function payRequest($tripId, $aprovalUserId, $user, $data)
+ 
+     public function acceptRequest($tripId, $acceptedUserId, $user, $data)
+     {
+-        $criteria = [
+-            'request_state' => Passenger::STATE_PENDING,
+-        ];
+-
+-        $acceptRequest = $this->changeRequestState($tripId, $acceptedUserId, Passenger::STATE_ACCEPTED, $criteria);
++        return DB::transaction(function () use ($tripId, $acceptedUserId) {
++            $trip = Trip::query()->lockForUpdate()->find($tripId);
++            if (! $trip || ! $this->isUserRequestPending($tripId, $acceptedUserId)) {
++                return null;
++            }
++            if ($trip->passengerAccepted()->count() >= $trip->total_seats) {
++                return null;
++            }
+ 
+-        return $acceptRequest;
++            return $this->changeRequestState($tripId, $acceptedUserId, Passenger::STATE_ACCEPTED, [
++                'request_state' => Passenger::STATE_PENDING,
++            ]);
++        });
+     }
+ 
+     public function rejectRequest($tripId, $rejectedUserId, $user, $data)
+diff --git a/app/Services/Logic/PassengersManager.php b/app/Services/Logic/PassengersManager.php
+index c37cf07..0dfe789 100755
+--- a/app/Services/Logic/PassengersManager.php
++++ b/app/Services/Logic/PassengersManager.php
+@@ -108,10 +108,6 @@ public function newRequest($tripId, $user, $data = [])
+         if (! $this->isInputValid($input)) {
+             return;
+         }
+-        if ($this->passengerRepository->userHasActiveRequest($tripId, $userId)) {
+-            return;
+-        }
+-
+         $trip = $this->tripLogic->show($user, $tripId);
+         if ($trip && ! $trip->expired()) {
+             $module_unaswered_message_limit = config('carpoolear.module_unaswered_message_limit', false);
+@@ -141,9 +137,13 @@ public function newRequest($tripId, $user, $data = [])
+                 if ($shouldAutoAccept) {
+                     // $result = $this->passengerRepository->acceptRequest($tripId, $user->id, $trip->user, $data);
+                     if (! config('carpoolear.module_trip_seats_payment', false)) {
+-                        if ($result = $this->passengerRepository->acceptRequest($tripId, $user->id, $trip->user, $data)) {
++                        $accepted = $this->passengerRepository->acceptRequest($tripId, $user->id, $trip->user, $data);
++                        if ($accepted) {
++                            $result = $accepted;
+                             event(new AutoRequestEvent($trip, $user, $trip->user));
+                             event(new AcceptEvent($trip, $trip->user, $user));
++                        } else {
++                            event(new RequestEvent($trip, $user, $trip->user));
+                         }
+                     } else {
+                         if ($result = $this->passengerRepository->aproveForPaymentRequest($tripId, $user->id, $trip->user, $data)) {
+@@ -184,7 +184,9 @@ public function cancelRequest($tripId, $cancelUserId, $user, $data = [])
+             $canceledState = Passenger::CANCELED_REQUEST;
+         }
+ 
+-        if ($this->isUserRequestAccepted($tripId, $cancelUserId) || $this->isUserRequestWaitingPayment($tripId, $cancelUserId)) {
++        $callerMayCancelForPassenger = $trip && $this->tripLogic->tripOwner($user, $trip);
++        if (($this->isUserRequestAccepted($tripId, $cancelUserId) || $this->isUserRequestWaitingPayment($tripId, $cancelUserId))
++            && ((int) $cancelUserId === (int) $user->id || $callerMayCancelForPassenger)) {
+             if ((int) $cancelUserId === (int) $user->id) {
+                 if ($this->isUserRequestWaitingPayment($tripId, $cancelUserId)) {
+                     $canceledState = Passenger::CANCELED_PASSENGER_WHILE_PAYING;
+diff --git a/tests/Feature/Http/CriticalInvariantsEvaluationTest.php b/tests/Feature/Http/CriticalInvariantsEvaluationTest.php
+new file mode 100644
+index 0000000..ccf9a6e
+--- /dev/null
++++ b/tests/Feature/Http/CriticalInvariantsEvaluationTest.php
+@@ -0,0 +1,63 @@
++<?php
++
++namespace Tests\Feature\Http;
++
++use STS\Models\Passenger;
++use STS\Models\Trip;
++use STS\Models\User;
++use Tests\TestCase;
++
++class CriticalInvariantsEvaluationTest extends TestCase
++{
++    public function test_unrelated_user_cannot_cancel_accepted_passenger_but_owner_can(): void
++    {
++        $owner = User::factory()->create();
++        $passenger = User::factory()->create();
++        $stranger = User::factory()->create();
++        $trip = Trip::factory()->create(['user_id' => $owner->id]);
++        Passenger::factory()->aceptado()->create(['trip_id' => $trip->id, 'user_id' => $passenger->id]);
++
++        $this->actingAs($stranger, 'api')
++            ->postJson("/api/trips/{$trip->id}/requests/{$passenger->id}/cancel")
++            ->assertUnprocessable();
++        $this->assertSame(Passenger::STATE_ACCEPTED, Passenger::query()->first()->request_state);
++
++        $this->actingAs($owner, 'api')
++            ->postJson("/api/trips/{$trip->id}/requests/{$passenger->id}/cancel")
++            ->assertOk();
++        $this->assertSame(Passenger::STATE_CANCELED, Passenger::query()->first()->request_state);
++    }
++
++    public function test_public_registration_ignores_server_owned_flags(): void
++    {
++        $email = 'critical-invariants-'.uniqid().'@example.com';
++        $this->postJson('/api/users', [
++            'name' => 'Untrusted Registration', 'email' => $email,
++            'password' => 'password', 'password_confirmation' => 'password',
++            'is_admin' => true, 'active' => true, 'identity_validated' => true,
++            'driver_is_verified' => true,
++        ])->assertOk();
++
++        $user = User::query()->where('email', $email)->firstOrFail();
++        $this->assertFalse((bool) $user->is_admin);
++        $this->assertFalse((bool) $user->active);
++        $this->assertFalse((bool) $user->identity_validated);
++        $this->assertFalse((bool) $user->driver_is_verified);
++    }
++
++    public function test_autoaccept_keeps_second_request_pending_when_capacity_is_full(): void
++    {
++        $owner = User::factory()->create(['autoaccept_requests' => true, 'identity_validated' => true]);
++        $trip = Trip::factory()->create(['user_id' => $owner->id, 'total_seats' => 1]);
++        $first = User::factory()->create(['identity_validated' => true]);
++        $second = User::factory()->create(['identity_validated' => true]);
++
++        $this->actingAs($first, 'api')->postJson("/api/trips/{$trip->id}/requests")->assertOk();
++        $this->actingAs($second, 'api')->postJson("/api/trips/{$trip->id}/requests")->assertOk();
++
++        $this->assertSame(1, Passenger::query()->where('trip_id', $trip->id)
++            ->where('request_state', Passenger::STATE_ACCEPTED)->count());
++        $this->assertSame(1, Passenger::query()->where('trip_id', $trip->id)
++            ->where('request_state', Passenger::STATE_PENDING)->count());
++    }
++}

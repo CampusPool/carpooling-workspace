@@ -1,0 +1,831 @@
+<?php
+
+namespace STS\Services\Logic;
+
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
+use STS\Events\User\Create as CreateEvent;
+use STS\Events\User\Update as UpdateEvent;
+use STS\Helpers\DocumentIdHelper;
+use STS\Models\BannedUser;
+use STS\Models\Car;
+use STS\Models\Passenger;
+use STS\Models\Trip;
+use STS\Models\User;
+use STS\Repository\CarsRepository;
+use STS\Repository\FileRepository;
+use STS\Repository\TripRepository;
+use STS\Repository\UserRepository;
+use STS\Services\HeicToJpegConverter;
+use STS\Services\ImageUploadValidator;
+use STS\Services\UserEditablePropertiesService;
+use STS\Support\FacebookProfileUrl;
+use Validator;
+
+class UsersManager extends BaseManager
+{
+    protected $repo;
+
+    protected $tripRepository;
+
+    protected $carsRepository;
+
+    protected $userEditablePropertiesService;
+
+    private function isFacebookProfileUrlModuleEnabled(): bool
+    {
+        return (bool) config('carpoolear.module_facebook_profile_url_enabled', false);
+    }
+
+    private function prepareFacebookProfileUrl(array $data): array
+    {
+        if (! $this->isFacebookProfileUrlModuleEnabled() || ! array_key_exists('facebook_profile_url', $data)) {
+            return $data;
+        }
+
+        $raw = $data['facebook_profile_url'];
+        if ($raw === null || trim((string) $raw) === '') {
+            $data['facebook_profile_url'] = null;
+
+            return $data;
+        }
+
+        $normalized = FacebookProfileUrl::tryNormalize((string) $raw);
+        if ($normalized !== null) {
+            $data['facebook_profile_url'] = $normalized;
+        }
+
+        return $data;
+    }
+
+    public function __construct(
+        UserRepository $userRep,
+        TripRepository $tripRepository,
+        ?CarsRepository $carsRepository = null,
+        ?UserEditablePropertiesService $userEditablePropertiesService = null
+    ) {
+        $this->repo = $userRep;
+        $this->tripRepository = $tripRepository;
+        $this->carsRepository = $carsRepository ?: new CarsRepository;
+        $this->userEditablePropertiesService = $userEditablePropertiesService ?? new UserEditablePropertiesService;
+    }
+
+    public function validator(array $data, $id = null, $is_social = false, $is_driver = false, $is_admin = false)
+    {
+        if ($id) {
+            $rules = [
+                'name' => 'max:255',
+                'email' => 'email|max:255|unique:users,email,'.$id,
+                'password' => 'min:6|confirmed',
+            ];
+            if (config('carpoolear.module_unique_doc_phone', false) && ! $is_admin) {
+                $rules['nro_doc'] = 'unique:users,nro_doc,'.$id;
+                $rules['mobile_phone'] = 'unique:users,mobile_phone,'.$id;
+            }
+            if ($this->isFacebookProfileUrlModuleEnabled()) {
+                $rules['facebook_profile_url'] = [
+                    'nullable',
+                    'max:255',
+                    function ($attribute, $value, $fail) {
+                        if ($value === null || trim((string) $value) === '') {
+                            return;
+                        }
+                        if (FacebookProfileUrl::tryNormalize((string) $value) === null) {
+                            $fail('El enlace debe ser un perfil de Facebook válido (por ejemplo facebook.com/tu-perfil).');
+                        }
+                    },
+                ];
+            }
+        } else {
+            if (! $is_social) {
+                $rules = [
+                    'name' => 'required|max:255',
+                    'email' => 'required|email|max:255|unique:users',
+                    'password' => 'min:6|confirmed',
+                    // 'gender'   => 'string|in:Masculino,Feminino,N/A',
+                    'emails_notifications' => 'boolean',
+                ];
+            } else {
+                $rules = [
+                    'name' => 'required|max:255',
+                    'email' => 'present|email|max:255|unique:users',
+                    'password' => 'min:6|confirmed',
+                    // 'gender'   => 'string|in:Masculino,Feminino,N/A',
+                    'emails_notifications' => 'boolean',
+                ];
+            }
+        }
+        if (config('carpoolear.module_validated_drivers', false) && $is_driver) {
+            $rules['driver_data_docs'] = 'required|array|min:1';
+        }
+        if ($is_admin) {
+            unset($rules['email']);
+            // Add patente validation for admin updates
+            if (isset($data['patente'])) {
+                $rules['patente'] = 'string|max:10';
+                $rules['car_description'] = 'nullable|string|max:255';
+            }
+        }
+        $validator = Validator::make($data, $rules);
+
+        return $validator;
+    }
+
+    /**
+     * Create a new user instance after a valid registration.
+     *
+     *
+     * @return User
+     */
+    public function create(array $data, $validate = true, $is_social = false, $is_driver = false)
+    {
+        unset($data['facebook_profile_url']);
+        $v = $this->validator($data, null, $is_social, $is_driver);
+        if ($v->fails() && $validate) {
+            $this->setErrors($v->errors());
+
+            return;
+        } else {
+            $data['emails_notifications'] = true;
+            if (isset($data['password'])) {
+                $data['password'] = bcrypt($data['password']);
+            }
+            // if token (reCAPTCHA) is not present, use email confirmation
+            if (! isset($data['token'])) {
+                if (! isset($data['active'])) {
+                    $data['active'] = false;
+                    $data['activation_token'] = Str::random(40);
+
+                    $u = $this->repo->create($data);
+
+                    // Check if user name contains any banned words
+                    $banned_words = config('carpoolear.banned_words_names', []);
+                    if (! empty($banned_words)) {
+                        $user_name_lower = strtolower($u->name);
+                        foreach ($banned_words as $word) {
+                            if (str_contains($user_name_lower, strtolower($word))) {
+                                $this->repo->update($u, ['banned' => 1], true);
+                                \Log::info('User banned due to name containing banned word: '.$u->name.' (matched: '.$word.')');
+                                break;
+                            }
+                        }
+                    }
+
+                    event(new CreateEvent($u->id));
+
+                    return $u;
+                }
+            } else {
+                // if we have reCAPTCHA token, skip email verification
+                $data['active'] = true;
+
+                $url = 'https://www.google.com/recaptcha/api/siteverify';
+
+                $recaptchaSecretKey = (string) config('carpoolear.recaptcha_secret_key', '');
+
+                $recaptchaData = [
+                    'secret' => $recaptchaSecretKey,
+                    'response' => $_POST['token'],
+                    'remoteip' => $_SERVER['REMOTE_ADDR'],
+                ];
+
+                $options = [
+                    'http' => [
+                        'header' => "Content-type: application/x-www-form-urlencoded\r\n",
+                        'method' => 'POST',
+                        'content' => http_build_query($recaptchaData),
+                    ],
+                ];
+
+                // Creates and returns stream context with options supplied in options preset
+                $response = $this->fetchRecaptchaVerificationResponse($url, $options);
+                // Takes a JSON encoded string and converts it into a PHP variable
+                $res = is_string($response) ? json_decode($response, true) : null;
+
+                // END setting reCaptcha v3 validation data
+
+                // Post form OR output alert and bypass post if false. NOTE: score conditional is optional
+                // since the successful score default is set at >= 0.5 by Google. Some developers want to
+                // be able to control score result conditions, so I included that in this example.
+
+                if (is_array($res) && ($res['success'] ?? false) === true && ($res['score'] ?? 0) >= 0.5) {
+                    // if (true) {
+                    $u = $this->repo->create($data);
+
+                    // Check if user name contains any banned words
+                    $banned_words = config('carpoolear.banned_words_names', []);
+                    if (! empty($banned_words)) {
+                        $user_name_lower = strtolower($u->name);
+                        foreach ($banned_words as $word) {
+                            if (str_contains($user_name_lower, strtolower($word))) {
+                                $this->repo->update($u, ['banned' => 1], true);
+                                \Log::info('User banned due to name containing banned word: '.$u->name.' (matched: '.$word.')');
+                                break;
+                            }
+                        }
+                    }
+
+                    event(new CreateEvent($u->id));
+
+                    return $u;
+                }
+
+                $this->logRecaptchaRegistrationFailure($data, $response, is_array($res) ? $res : null);
+
+                return false;
+            }
+
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>|null  $res
+     */
+    protected function logRecaptchaRegistrationFailure(array $data, string|false $response, ?array $res): void
+    {
+        $captchaToken = (string) ($data['token'] ?? $_POST['token'] ?? '');
+
+        \Log::warning('Registration reCAPTCHA verification failed', [
+            'email' => $data['email'] ?? null,
+            'recaptcha_configured' => (string) config('carpoolear.recaptcha_secret_key', '') !== '',
+            'captcha_token_present' => $captchaToken !== '',
+            'captcha_token_length' => strlen($captchaToken),
+            'siteverify_response_received' => $response !== false,
+            'siteverify_raw_length' => is_string($response) ? strlen($response) : null,
+            'success' => is_array($res) ? ($res['success'] ?? null) : null,
+            'score' => is_array($res) ? ($res['score'] ?? null) : null,
+            'error_codes' => is_array($res) ? ($res['error-codes'] ?? null) : null,
+            'remote_ip' => $_SERVER['REMOTE_ADDR'] ?? null,
+        ]);
+    }
+
+    /**
+     * POST to Google reCAPTCHA siteverify (stream wrapper). Overridden in tests to avoid network.
+     *
+     * @param  array<string, mixed>  $options  Options for {@see stream_context_create()} (http key)
+     */
+    protected function fetchRecaptchaVerificationResponse(string $url, array $options): string|false
+    {
+        $context = stream_context_create($options);
+
+        // Named argument avoids a meaningless `use_include_path` boolean (MSI: FalseToTrue on `false`).
+        return @file_get_contents($url, context: $context);
+    }
+
+    public function update($user, array $data, $is_driver = false, $is_admin = false)
+    {
+        foreach (['friendship_state', 'friend_trip_alerts_enabled', 'state'] as $virtualKey) {
+            if ($user->offsetExists($virtualKey)) {
+                $user->offsetUnset($virtualKey);
+            }
+        }
+
+        if (! $this->isFacebookProfileUrlModuleEnabled()) {
+            unset($data['facebook_profile_url']);
+        } else {
+            $data = $this->prepareFacebookProfileUrl($data);
+        }
+        $requestData = $data;
+        $actor = $is_admin ? auth()->user() : null;
+        $data = $this->userEditablePropertiesService->filterForUser(
+            $data,
+            $is_admin,
+            $user,
+            $actor instanceof User ? $actor : null
+        );
+
+        // Alert when non-admin tries to change forbidden/flagged props (but don't block - allow old apps)
+        $bannedProperties = $this->userEditablePropertiesService->getBlockedFlaggedPropertiesThatDiffer(
+            $user,
+            $requestData,
+            $data,
+            $is_admin
+        );
+        if (! empty($bannedProperties)) {
+            \Log::warning('Edición prohibida de perfil intentada (ignorada, cambios permitidos aplicados)', [
+                'user_id' => $user->id,
+                'user_name' => $user->name,
+                'banned_properties' => $bannedProperties,
+            ]);
+            $this->userEditablePropertiesService->sendFlaggedPropertyAlert($user, $bannedProperties);
+        }
+
+        $v = $this->validator($data, $user->id, null, $is_driver, $is_admin);
+        if ($v->fails()) {
+            $this->setErrors($v->errors());
+
+            return;
+        }
+
+        $data = $this->prepareDocumentNumber($data);
+        if ($data === null) {
+            return;
+        }
+
+        // Check if nro_doc is banned (only on user update, not registration)
+        if (! $is_admin && isset($data['nro_doc']) && ! empty(trim((string) $data['nro_doc']))) {
+            $nroDoc = DocumentIdHelper::normalizeForBanCheck((string) $data['nro_doc']);
+            if (! empty($nroDoc) && BannedUser::where('nro_doc', $nroDoc)->exists()) {
+                \Log::warning('Intento de usar DNI banneado', [
+                    'user_id' => $user->id,
+                    'user_name' => $user->name,
+                ]);
+                $webhookUrl = config('services.slack.banned_dni_webhook_url');
+                if (! empty($webhookUrl)) {
+                    $profileLink = $this->userEditablePropertiesService->frontendAdminProfileUrl($user->id);
+                    $slackMessage = "@channel Intento de uso de DNI banneado: {$nroDoc} en user ID: {$user->id} Link al perfil: {$profileLink}";
+                    try {
+                        $response = Http::timeout(3)->post($webhookUrl, ['text' => $slackMessage]);
+                        if (! $response->successful()) {
+                            \Log::warning('Slack banned DNI webhook failed', ['status' => $response->status(), 'body' => $response->body()]);
+                        }
+                    } catch (\Throwable $e) {
+                        \Log::warning('Slack banned DNI webhook failed', ['error' => $e->getMessage()]);
+                    }
+                }
+                $this->setErrors(['error' => 'banned_dni']);
+
+                return;
+            }
+        }
+
+        if (isset($data['password'])) {
+            $data['password'] = bcrypt($data['password']);
+        }
+        $img_names = [];
+        $driverDocsNotifyAdmin = false;
+        if (isset($data['driver_data_docs'])) {
+            if ($is_driver && is_array($data['driver_data_docs']) && count($data['driver_data_docs'])) {
+                $driverDocsNotifyAdmin = ! $user->driver_is_verified;
+                foreach ($data['driver_data_docs'] as $file) {
+                    if ($file) {
+                        if (is_string($file)) {
+                            $img_names[] = $file;
+                        } else {
+                            $uploaded = $this->uploadDoc($file);
+                            if ($uploaded === false) {
+                                return null;
+                            }
+                            $img_names[] = $uploaded;
+                        }
+                    }
+                }
+                $data['driver_data_docs'] = json_encode($img_names);
+            } else {
+                if (is_array($data['driver_data_docs']) && count($data['driver_data_docs'])) {
+                    $data['driver_data_docs'] = json_encode($data['driver_data_docs']);
+                }
+            }
+        }
+        // Handle car/patente updates for admin
+        if ($is_admin && (isset($data['patente']) || isset($data['car_description']))) {
+            $this->updateUserCar($user, $data);
+            // Remove car fields from user data to avoid trying to update user table with car fields
+            unset($data['patente'], $data['car_description']);
+        }
+
+        $this->repo->update($user, $data, $is_admin);
+        if ($user->banned > 0) {
+            // hide user trips
+            $this->tripRepository->hideTrips($user);
+        } else {
+            $this->tripRepository->unhideTrips($user);
+        }
+
+        // Refresh user relationships to get updated car data
+        $user->load('cars');
+
+        if ($driverDocsNotifyAdmin) {
+            // send email to admin (flag captured before driver_data_docs is JSON-encoded for persistence)
+            $email_admin = config('carpoolear.admin_email', '');
+            if (! empty($email_admin)) {
+                $mailPayload = [
+                    'title' => 'Usuario quiere ser conductor',
+                    'user' => $user,
+                ];
+                \Mail::send('email.user_be_driver', $mailPayload, function ($message) use ($email_admin, $mailPayload) {
+                    $message->to($email_admin, 'Admin')->subject($mailPayload['title']);
+                });
+            }
+        }
+        event(new UpdateEvent($user->id));
+
+        return $user;
+    }
+
+    protected function prepareDocumentNumber(array $data): ?array
+    {
+        if (! array_key_exists('nro_doc', $data)) {
+            return $data;
+        }
+
+        $trimmed = trim((string) $data['nro_doc']);
+        if ($trimmed === '') {
+            return $data;
+        }
+
+        $normalized = DocumentIdHelper::normalizeForStorage($data['nro_doc']);
+        if ($normalized === null) {
+            $this->setErrors(['nro_doc' => ['El número de documento no es válido.']]);
+
+            return null;
+        }
+
+        $data['nro_doc'] = $normalized;
+
+        return $data;
+    }
+
+    public function mailUnsuscribe($email)
+    {
+        $data['emails_notifications'] = false;
+        $user = $this->repo->getUserBy('email', $email);
+        $this->repo->update($user, $data);
+
+        return $user;
+    }
+
+    public function uploadDoc(UploadedFile $file)
+    {
+        $validator = app(ImageUploadValidator::class);
+        $result = $validator->validate($file, 'image');
+        if (! ($result['valid'] ?? true)) {
+            $this->setErrors($result['errors'] ?? []);
+
+            return false;
+        }
+
+        $converter = app(HeicToJpegConverter::class);
+        $jpegContent = $converter->convert($file);
+
+        $mil = str_replace('.', '', microtime());
+        $mil = str_replace(' ', '', $mil);
+        $newfilename = date('mdYHis').$mil;
+        $docsDir = base_path().'/public/image/docs/';
+
+        if (! File::isDirectory($docsDir)) {
+            File::makeDirectory($docsDir, 0755, true);
+        }
+
+        if ($jpegContent !== null) {
+            $imageName = $newfilename.'.jpg';
+            File::put($docsDir.$imageName, $jpegContent);
+
+            return $imageName;
+        }
+
+        $extension = $file->getClientOriginalExtension();
+        $imageName = $newfilename.'.'.$extension;
+        $file->move($docsDir, $imageName);
+
+        return $imageName;
+    }
+
+    public function updatePhoto($user, $data)
+    {
+        $v = Validator::make($data, ['profile' => 'required']);
+        if ($v->fails()) {
+            $this->setErrors($v->errors());
+
+            return;
+        } else {
+            $fileManager = new FileRepository;
+            $base64_string = $data['profile'];
+
+            $data = explode(',', $base64_string);
+            if (is_array($data) && count($data) > 1) {
+                $data = base64_decode($data[1]);
+
+                $name = $fileManager->createFromData($data, 'jpeg', 'image/profile');
+
+                $this->repo->updatePhoto($user, $name);
+
+                event(new UpdateEvent($user->id));
+
+                return $user;
+            } else {
+                $error = new \stdClass;
+                $error->error = 'error_uploading_image';
+                $this->setErrors($error);
+
+                return;
+            }
+        }
+    }
+
+    /**
+     * Update user's car information (patente and description)
+     */
+    private function updateUserCar($user, $data)
+    {
+        $car = $this->carsRepository->getUserCar($user->id);
+
+        if ($car) {
+            // Update existing car
+            $carData = [];
+            if (isset($data['patente'])) {
+                $carData['patente'] = $data['patente'];
+            }
+            if (isset($data['car_description'])) {
+                $carData['description'] = $data['car_description'];
+            }
+
+            if (! empty($carData)) {
+                $car->update($carData);
+            }
+        } else {
+            // Create new car if user doesn't have one
+            if (isset($data['patente'])) {
+                $description = $data['car_description'] ?? 'Car description not provided';
+                $car = new Car;
+                $car->user_id = $user->id;
+                $car->patente = $data['patente'];
+                $car->description = $description;
+                $this->carsRepository->create($car);
+            }
+        }
+    }
+
+    public function find($user_id)
+    {
+        return $this->repo->show($user_id);
+    }
+
+    public function activeAccount($activation_token)
+    {
+        $user = $this->repo->getUserBy('activation_token', $activation_token);
+        if ($user) {
+            $this->repo->update($user, ['active' => true, 'activation_token' => null], true);
+
+            return $user;
+        } else {
+            $this->setErrors(['error' => 'invalid_activation_token']);
+
+            return;
+        }
+    }
+
+    public function resetPassword($email)
+    {
+        $enableEmailLogging = config('carpoolear.log_emails', false);
+
+        // Log to email_logs channel if enabled
+        if ($enableEmailLogging) {
+            \Log::channel('email_logs')->info('PASSWORD_RESET_REQUEST', [
+                'email' => $email,
+                'timestamp' => now()->toIso8601String(),
+                'ip' => request()->ip(),
+            ]);
+        }
+
+        $user = $this->repo->getUserBy('email', $email);
+        if ($user) {
+            // Check for cooldown period (5 minutes between requests)
+            $cooldownMinutes = 5;
+            $lastReset = $this->repo->getLastPasswordReset($user->email);
+
+            if ($lastReset && (int) $lastReset->created_at->diffInMinutes(now()) < $cooldownMinutes) {
+                $remainingMinutes = $cooldownMinutes - (int) $lastReset->created_at->diffInMinutes(now());
+                $this->setErrors(['error' => "Please wait {$remainingMinutes} minutes before requesting another password reset"]);
+
+                // Log to email_logs channel if enabled
+                if ($enableEmailLogging) {
+                    \Log::channel('email_logs')->warning('PASSWORD_RESET_COOLDOWN', [
+                        'user_id' => $user->id,
+                        'email' => $user->email,
+                        'remaining_minutes' => $remainingMinutes,
+                        'last_reset_at' => $lastReset->created_at->toIso8601String(),
+                        'timestamp' => now()->toIso8601String(),
+                    ]);
+                }
+
+                return;
+            }
+
+            $token = Str::random(40);
+            $this->repo->deleteResetToken('email', $user->email);
+            $this->repo->storeResetToken($user, $token);
+
+            $domain = config('app.url');
+            $name_app = config('carpoolear.name_app');
+            $url = config('app.url').'/app/reset-password/'.$token;
+
+            // Queue the email sending job instead of sending synchronously
+            \STS\Jobs\SendPasswordResetEmail::dispatch($user, $token, $url, $name_app, $domain)
+                ->onQueue('emails') // Use a dedicated queue for emails
+                ->delay(now()->addSeconds(10)); // Add a small delay to prevent immediate retries
+
+            // Log to email_logs channel if enabled
+            if ($enableEmailLogging) {
+                \Log::channel('email_logs')->info('PASSWORD_RESET_QUEUED', [
+                    'user_id' => $user->id,
+                    'email' => $user->email,
+                    'token' => substr($token, 0, 10).'...', // Partial token for debugging
+                    'timestamp' => now()->toIso8601String(),
+                ]);
+            }
+
+            return $token;
+        } else {
+            $this->setErrors(['error' => 'user_not_found']);
+
+            \Log::warning('Password reset requested for non-existent user', ['email' => $email]);
+
+            // Log to email_logs channel if enabled
+            if ($enableEmailLogging) {
+                \Log::channel('email_logs')->warning('PASSWORD_RESET_USER_NOT_FOUND', [
+                    'email' => $email,
+                    'timestamp' => now()->toIso8601String(),
+                    'ip' => request()->ip(),
+                ]);
+            }
+
+            return;
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     */
+    private function buildPasswordResetUpdateData(array $data, User $user): array
+    {
+        $filtered = $this->userEditablePropertiesService->filterForUser(
+            array_intersect_key($data, array_flip(['password', 'password_confirmation'])),
+            false,
+            $user
+        );
+
+        return [
+            'password' => bcrypt($filtered['password']),
+            'active' => true,
+        ];
+    }
+
+    public function changePassword($token, $data)
+    {
+        $user = $this->repo->getUserByResetToken($token);
+        if ($user) {
+            $v = $this->validator($data, $user->id, null, false, false);
+            if ($v->fails()) {
+                $this->setErrors($v->errors());
+
+                return;
+            }
+            $updateData = $this->buildPasswordResetUpdateData($data, $user);
+            $this->repo->update($user, $updateData, true);
+            $this->repo->deleteResetToken('email', $user->email);
+
+            return true;
+        }
+    }
+
+    public function show($user, $profile_id)
+    {
+        $profile = $this->repo->show($profile_id);
+        if ($profile) {
+            if ($user && $profile->id !== $user->id) {
+                $friendsManager = app(FriendsManager::class);
+                $profile->friendship_state = $friendsManager->getFriendshipState($user, $profile);
+                if ($profile->friendship_state === 'friend') {
+                    $alertRepo = app(\STS\Repository\FriendTripAlertRepository::class);
+                    $profile->friend_trip_alerts_enabled = $alertRepo->isSubscribed($user, $profile);
+                }
+            }
+
+            return $profile;
+        }
+        $this->setErrors(['error' => 'profile not found']);
+    }
+
+    public function index($user, $search_text)
+    {
+        return $this->repo->index($user, $search_text);
+    }
+
+    public function tripsCount($user, $type = null)
+    {
+        $cantidad = 0;
+        if ($type == Passenger::TYPE_CONDUCTOR || is_null($type)) {
+            $cantidad += $user->trips(Trip::FINALIZADO)->count();
+        }
+        if ($type == Passenger::TYPE_PASAJERO || is_null($type)) {
+            $cantidad += $user->tripsAsPassenger(Trip::FINALIZADO)->count();
+        }
+
+        return $cantidad;
+    }
+
+    public function refreshTripsCount($user): int
+    {
+        $count = $this->tripsCount($user);
+
+        // Persist only the cached count. Profile/index responses attach ephemeral
+        // attributes (friendship_state, state, friend_trip_alerts_enabled) that are
+        // not DB columns and must not be included in Model::save().
+        User::whereKey($user->id)->update(['trips_count' => $count]);
+        $user->trips_count = $count;
+
+        return $count;
+    }
+
+    public function resolveTripsCount($user): int
+    {
+        return (int) ($user->trips_count ?? 0);
+    }
+
+    public function tripsDistance($user, $type = null)
+    {
+        $distancia = 0;
+        if ($type == Passenger::TYPE_CONDUCTOR || is_null($type)) {
+            $distancia += $user->trips(Trip::FINALIZADO)->sum('distance');
+        }
+        if ($type == Passenger::TYPE_PASAJERO || is_null($type)) {
+            $distancia += $user->tripsAsPassenger(Trip::FINALIZADO)->sum('distance');
+        }
+
+        return $distancia;
+    }
+
+    public function unansweredConversationOrRequestsByTrip($trip)
+    {
+        $count = $this->repo->unansweredConversationOrRequestsByTrip($trip->user_id, $trip->id);
+        if (isset($trip->user->unaswered_messages_limit) && $trip->user->unaswered_messages_limit > 0) {
+            return $count < $trip->user->unaswered_messages_limit;
+        } else {
+            return true;
+        }
+    }
+
+    public function seatRequestLimitStatus($trip): array
+    {
+        $moduleEnabled = config('carpoolear.module_unaswered_message_limit', false);
+        $limit = isset($trip->user->unaswered_messages_limit)
+            ? (int) $trip->user->unaswered_messages_limit
+            : 0;
+
+        if (! $moduleEnabled || $limit <= 0) {
+            return ['limit' => null, 'reached' => false];
+        }
+
+        $allow = $this->unansweredConversationOrRequestsByTrip($trip);
+
+        return [
+            'limit' => $limit,
+            'reached' => ! $allow,
+        ];
+    }
+
+    public function searchUsers($name)
+    {
+        return $this->repo->searchUsers($name);
+    }
+
+    public function migrateUsers($user_id_delete, $user_id_keep)
+    {
+        // $exitCode = \Artisan::call("user:update {$user_id_delete} {$user_id_keep}", []);
+        $exitCode = \Artisan::call('test:test', []);
+    }
+
+    public function registerDonation($user, $donation)
+    {
+        $donation->user_id = $user->id;
+        $donation->month = date('Y-m-01 00:00:00');
+        $donation->save();
+
+        return $donation;
+    }
+
+    public function bankData()
+    {
+        $bankPath = storage_path().'/banks/';
+        $ccPath = storage_path().'/cc/';
+        $country = config('carpoolear.osm_country', 'ARG');
+        $banks = json_decode(file_get_contents($bankPath.$country.'.json'), true);
+        $cc = json_decode(file_get_contents($ccPath.$country.'.json'), true);
+
+        return (object) [
+            'cc' => $cc,
+            'banks' => $banks,
+        ];
+    }
+
+    public function termsText($lang)
+    {
+        $path = storage_path().'/terms/';
+        $app_name = config('carpoolear.target_app');
+        if (! empty($lang)) {
+            $path = $path.$app_name.'_'.$lang.'.html';
+        } else {
+            $path = $path.$app_name.'.html';
+        }
+        $html = file_get_contents($path);
+        $response = new \stdClass;
+        $response->content = $html;
+
+        return $response;
+    }
+}

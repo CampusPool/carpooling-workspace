@@ -1,0 +1,261 @@
+<?php
+
+namespace STS\Repository;
+
+use Carbon\Carbon;
+use STS\Models\Conversation;
+use STS\Models\Passenger;
+use STS\Models\PasswordReset;
+use STS\Models\User;
+use STS\Support\UserSearchFilter;
+
+class UserRepository
+{
+    /**
+     * Fields that must not be mass-assigned unless the caller explicitly opts in
+     * (e.g. admin updates or trusted system flows like account activation).
+     *
+     * @var list<string>
+     */
+    private const PROTECTED_FIELDS = [
+        'banned',
+        'active',
+        'driver_is_verified',
+        'identity_validated',
+        'identity_validated_at',
+        'identity_validation_type',
+        'identity_validation_reject_reason',
+        'validate_by_date',
+    ];
+
+    /**
+     * Create a new user instance after a valid registration.
+     *
+     *
+     * @return User
+     */
+    public function create(array $data)
+    {
+        return User::create($data);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public function update($user, array $data, bool $allowProtectedFields = false)
+    {
+        unset($data['is_admin']);
+        if (! $allowProtectedFields) {
+            foreach (self::PROTECTED_FIELDS as $field) {
+                unset($data[$field]);
+            }
+        }
+        $user->update($data);
+    }
+
+    public function migrateUsers($user_id_delete, $user_id_keep)
+    {
+        $user = User::find($user_id_keep);
+        $user_delete = User::find($user_id_delete);
+        if ($user && $user_delete) {
+            $this->invokeMigrateUserMerge($user, $user_delete);
+        }
+    }
+
+    /** @internal Overridden in tests to avoid calling `User::migrateUser()` (not present on the model in this codebase). */
+    protected function invokeMigrateUserMerge(User $userKeep, User $userToDelete): void
+    {
+        $userKeep->migrateUser($userToDelete);
+    }
+
+    public function show($id)
+    {
+        $user = User::with(['accounts', 'donations', 'referencesReceived', 'cars'])->where('id', $id)->first();
+        // prevent from returning the private_note to the frontend
+        if ($user) {
+            $user->private_note = null;
+        }
+
+        // $exitCode = \Artisan::call('test:test', []);
+        // \Log::info('Test COMMAND exit' . $exitCode);
+        return $user;
+    }
+
+    public function acceptTerms($user)
+    {
+        $user->terms_and_conditions = true;
+        $user->save();
+
+        return $user;
+    }
+
+    public function updatePhoto($user, $filename)
+    {
+        $user->image = $filename;
+        $user->save();
+
+        return $user;
+    }
+
+    public function getUserBy($key, $value)
+    {
+        return User::where($key, $value)->first();
+    }
+
+    public function searchUsers($name)
+    {
+        if (! is_string($name)) {
+            return null;
+        }
+        $term = trim($name);
+        if ($term === '') {
+            return null;
+        }
+
+        $users = User::query();
+        UserSearchFilter::apply($users, $term);
+        $users->with(['accounts', 'cars']);
+        $users->orderBy('name');
+        $users->limit(9);
+        $users = $users->get();
+
+        return $users;
+    }
+
+    public function index($user, $search_text = null)
+    {
+        $users = User::where('active', true)
+            ->where('banned', false)
+            ->where('id', '<>', $user->id);
+
+        $users->whereDoesntHave('friends', function ($q) use ($user) {
+            $q->where('id', $user->id);
+        });
+
+        if ($search_text) {
+            $users->where(function ($q) use ($search_text) {
+                $q->where('name', 'like', '%'.$search_text.'%');
+                // $q->orWhere('email', 'like', '%'.$search_text.'%');
+            });
+        }
+
+        $users->with(['accounts', 'cars']);
+        $users->orderBy('name');
+        $users = $users->get();
+
+        $friendsManager = app(\STS\Services\Logic\FriendsManager::class);
+        $users = $users->map(function ($item) use ($user, $friendsManager) {
+            $friendshipState = $friendsManager->getFriendshipState($user, $item);
+            $item->state = match ($friendshipState) {
+                'friend' => 'friend',
+                'pending_sent', 'pending_received' => 'request',
+                default => 'none',
+            };
+
+            return $item;
+        });
+
+        return $users;
+    }
+
+    public function addFriend($user, $friend, $provider = '')
+    {
+        $friend->friends()->detach($user->id);
+        $user->friends()->detach($friend->id);
+        $friend->friends()->attach($user->id, ['origin' => $provider, 'state' => User::FRIEND_ACCEPTED]);
+        $user->friends()->attach($friend->id, ['origin' => $provider, 'state' => User::FRIEND_ACCEPTED]);
+    }
+
+    public function deleteFriend($user, $friend)
+    {
+        $friend->friends()->detach($user->id);
+        $user->friends()->detach($friend->id);
+    }
+
+    public function friendList($user)
+    {
+        return $user->friends()->get();
+    }
+
+    public function storeResetToken($user, $token)
+    {
+        PasswordReset::query()->create([
+            'email' => $user->email,
+            'token' => $token,
+            'created_at' => Carbon::now(),
+        ]);
+    }
+
+    public function deleteResetToken($key, $value)
+    {
+        PasswordReset::query()->where($key, $value)->delete();
+    }
+
+    public function getUserByResetToken($token)
+    {
+        $pr = PasswordReset::query()->where('token', $token)->first();
+        if ($pr) {
+            return User::where('email', $pr->email)->first();
+        }
+    }
+
+    public function getLastPasswordReset($email)
+    {
+        return PasswordReset::query()
+            ->where('email', $email)
+            ->orderByDesc('created_at')
+            ->first();
+    }
+
+    public function getNotifications($user, $unread = false)
+    {
+        if ($unread) {
+            return $user->unreadNotifications;
+        }
+
+        return $user->notifications;
+    }
+
+    public function markNotification($notification)
+    {
+        $notification->readed();
+    }
+
+    public function unansweredConversationOrRequestsByTrip($userId, $tripId)
+    {
+        return $this->countPendingRequestsByTripOwner($userId, $tripId)
+            + $this->countUnansweredConversationsByTripOwner($userId, $tripId);
+    }
+
+    private function countPendingRequestsByTripOwner($userId, $tripId): int
+    {
+        return Passenger::with('trip')
+            ->where('trip_id', $tripId)
+            ->whereHas('trip', function ($q) use ($userId) {
+                $q->where('user_id', $userId);
+            })
+            ->where('request_state', Passenger::STATE_PENDING)
+            ->count();
+    }
+
+    private function countUnansweredConversationsByTripOwner($userId, $tripId): int
+    {
+        return Conversation::where('trip_id', $tripId)
+            ->where('type', Conversation::TYPE_PRIVATE_CONVERSATION)
+            ->whereDoesntHave('users', function ($query) use ($tripId, $userId) {
+                $query->where('users.id', '<>', $userId)
+                    ->whereHas('passenger', function ($passengerQuery) use ($tripId) {
+                        $passengerQuery->where('trip_id', $tripId)
+                            ->where('request_state', '<>', Passenger::STATE_PENDING);
+                    });
+            })
+            // Latest message is from someone other than the driver (awaiting reply).
+            // Important for reused private chats whose trip_id was updated: prior driver
+            // messages about another trip must not mark this inquiry as answered.
+            ->whereRaw(
+                '(select m.user_id from messages m where m.conversation_id = conversations.id order by m.id desc limit 1) <> ?',
+                [$userId]
+            )
+            ->count();
+    }
+}

@@ -1,0 +1,30 @@
+--- a/app/Services/Logic/TripsManager.php
++++ b/app/Services/Logic/TripsManager.php
+@@ -40,7 +40,7 @@
+                 'to_town' => 'required|string|max:255',
+                 'punto_partida' => 'required|string|max:255',
+                 'punto_llegada' => 'required|string|max:255',
+-                'trip_date' => 'required_without:weekly_schedule|nullable|date|after:now',
++                'trip_date' => \STS\Mobility\Dispatch\DispatchCreationContext::dateRule((int) $user_id, $data),
+                 'total_seats' => 'required|integer|max:5|min:1',
+                 'friendship_type_id' => 'required|integer|in:0,1,2',
+                 'estimated_time' => 'required|string',
+@@ -193,7 +193,7 @@
+ 
+             $data['user_id'] = $user->id;
+ 
+-            if (! empty($data['trip_date']) && empty($data['parent_trip_id'])) {
++            if (! empty($data['trip_date']) && empty($data['parent_trip_id']) && ! \STS\Mobility\Dispatch\DispatchCreationContext::activeFor((int) $user->id)) {
+                 $existingTrip = $this->tripRepo->findDuplicateTrip(
+                     $user->id,
+                     $data['from_town'],
+@@ -221,6 +221,9 @@
+                 }
+             }
+             $notifyCreated = static function () use ($trip): void {
++                if (\STS\Mobility\Dispatch\DispatchTripPolicy::managed((int) $trip->id)) {
++                    return;
++                }
+                 event(new CreateEvent($trip));
+                 $friendTripAlertService = app(FriendTripAlertService::class);
+                 if ($friendTripAlertService->isImmediatelyVisible($trip)) {

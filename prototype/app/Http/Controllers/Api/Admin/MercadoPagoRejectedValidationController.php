@@ -1,0 +1,188 @@
+<?php
+
+namespace STS\Http\Controllers\Api\Admin;
+
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use STS\Http\Controllers\Controller;
+use STS\Models\AdminActionLog;
+use STS\Models\MercadoPagoRejectedValidation;
+use STS\Models\SupportTicket;
+use STS\Services\AdminActionLogger;
+use STS\Services\IdentityVerificationOutcome;
+use STS\Services\UserIdentityVerificationSuccessService;
+use STS\Support\AdminPagination;
+
+class MercadoPagoRejectedValidationController extends Controller
+{
+    /**
+     * GET /api/admin/mercado-pago-rejected-validations - list, newest first (user_id, name, nro_doc, reject_reason, created_at).
+     */
+    public function index(Request $request): JsonResponse
+    {
+        $perPage = AdminPagination::resolvePerPage($request->query('per_page'));
+        $page = AdminPagination::resolvePage($request->query('page'));
+
+        $paginator = MercadoPagoRejectedValidation::with('user:id,name,nro_doc,identity_validated')
+            ->orderBy('created_at', 'desc')
+            ->paginate($perPage, ['*'], 'page', $page);
+
+        $items = collect($paginator->items())->map(function ($item) {
+            return [
+                'id' => $item->id,
+                'user_id' => $item->user_id,
+                'user_name' => $item->user ? $item->user->name : null,
+                'user_nro_doc' => $item->user ? $item->user->nro_doc : null,
+                'user_identity_validated' => $item->user ? (bool) $item->user->identity_validated : false,
+                'reject_reason' => $item->reject_reason,
+                'review_status' => $item->review_status,
+                'created_at' => $item->created_at->toDateTimeString(),
+            ];
+        })->values()->all();
+
+        return response()->json([
+            'data' => $items,
+            'meta' => [
+                'pagination' => AdminPagination::paginationMeta($paginator),
+            ],
+        ]);
+    }
+
+    /**
+     * GET /api/admin/mercado-pago-rejected-validations/{id} - single with user and review fields (review_status, review_note, reviewed_at, reviewed_by_name).
+     */
+    public function show(int $id): JsonResponse
+    {
+        $item = MercadoPagoRejectedValidation::with(['user:id,name,nro_doc,email,identity_validated', 'approvedBy:id,name', 'reviewedBy:id,name'])
+            ->findOrFail($id);
+
+        return response()->json([
+            'data' => $this->serializeItem($item),
+        ]);
+    }
+
+    /**
+     * POST /api/admin/mercado-pago-rejected-validations/{id}/review - action: approve|reject|pending, note: string (required for reject/pending, optional for approve).
+     * Records review_status, review_note, reviewed_at, reviewed_by. Approve: sets user identity_validated; Reject/Pending: clears user identity validation.
+     */
+    public function review(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'action' => 'required|in:approve,reject,pending',
+            'note' => 'required_if:action,reject,pending|nullable|string|min:1',
+        ]);
+
+        $item = MercadoPagoRejectedValidation::with('user')->findOrFail($id);
+        $user = $item->user;
+        if (! $user) {
+            return response()->json(['error' => 'User not found.'], 404);
+        }
+
+        $admin = $request->user();
+        $item->review_status = $validated['action'] === 'approve' ? 'approved' : ($validated['action'] === 'reject' ? 'rejected' : 'pending');
+        $item->review_note = $validated['note'] ?? '';
+        $item->reviewed_at = now();
+        $item->reviewed_by = $admin->id;
+
+        if ($validated['action'] === 'approve') {
+            app(UserIdentityVerificationSuccessService::class)->applyVerification($user, 'manual', [
+                'preserve_mercado_pago_rejected_validation_ids' => [$item->id],
+            ]);
+            $item->approved_at = now();
+            $item->approved_by = $admin->id;
+        } else {
+            $user->identity_validated = false;
+            $user->identity_validated_at = null;
+            $user->identity_validation_type = null;
+            $user->identity_validation_rejected_at = null;
+            $user->identity_validation_reject_reason = null;
+            $user->save();
+        }
+        $this->emitReviewOutcome($item, (int) $user->id, $validated['action']);
+
+        $item->save();
+        $item->load(['user:id,name,nro_doc,email,identity_validated', 'approvedBy:id,name', 'reviewedBy:id,name']);
+
+        AdminActionLogger::log(
+            $admin,
+            AdminActionLog::ACTION_IDENTITY_REVIEW,
+            (int) $user->id,
+            [
+                'source' => 'mercado_pago',
+                'validation_id' => $item->id,
+                'action' => $validated['action'],
+            ]
+        );
+
+        return response()->json(['data' => $this->serializeItem($item)]);
+    }
+
+    public function updatePrivateNote(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'private_admin_note' => 'nullable|string',
+        ]);
+
+        $item = MercadoPagoRejectedValidation::findOrFail($id);
+        $item->private_admin_note = $validated['private_admin_note'] ?? null;
+        $item->save();
+
+        return $this->show($id);
+    }
+
+    /**
+     * POST /api/admin/mercado-pago-rejected-validations/{id}/approve - validate the user manually (legacy shortcut; use review with action=approve).
+     */
+    public function approve(Request $request, int $id): JsonResponse
+    {
+        $request->merge(['action' => 'approve', 'note' => '']);
+
+        return $this->review($request, $id);
+    }
+
+    /**
+     * approve => succeeded, reject => failed, pending => info_requested (method manual, related to the MP rejection row).
+     */
+    private function emitReviewOutcome(MercadoPagoRejectedValidation $item, int $userId, string $action): void
+    {
+        [$name, $reason] = match ($action) {
+            'approve' => [IdentityVerificationOutcome::NAME_SUCCEEDED, IdentityVerificationOutcome::REASON_APPROVED_FROM_MP_REJECTION],
+            'reject' => [IdentityVerificationOutcome::NAME_FAILED, IdentityVerificationOutcome::REASON_REJECTED_FROM_MP_REJECTION],
+            default => [IdentityVerificationOutcome::NAME_INFO_REQUESTED, IdentityVerificationOutcome::REASON_PENDING_FROM_MP_REJECTION],
+        };
+
+        app(IdentityVerificationOutcome::class)->emit([
+            'user_id' => $userId,
+            'method' => IdentityVerificationOutcome::METHOD_MANUAL,
+            'name' => $name,
+            'reason' => $reason,
+            'related_type' => 'mercado_pago_rejected_validations',
+            'related_id' => $item->id,
+        ]);
+    }
+
+    private function serializeItem(MercadoPagoRejectedValidation $item): array
+    {
+        return [
+            'id' => $item->id,
+            'user_id' => $item->user_id,
+            'user_name' => $item->user ? $item->user->name : null,
+            'user_nro_doc' => $item->user ? $item->user->nro_doc : null,
+            'user_email' => $item->user ? $item->user->email : null,
+            'user_identity_validated' => $item->user ? (bool) $item->user->identity_validated : false,
+            'reject_reason' => $item->reject_reason,
+            'created_at' => $item->created_at->toDateTimeString(),
+            'mp_payload' => $item->mp_payload,
+            'approved_at' => $item->approved_at ? $item->approved_at->toDateTimeString() : null,
+            'approved_by' => $item->approved_by,
+            'approved_by_name' => $item->approvedBy ? $item->approvedBy->name : null,
+            'review_status' => $item->review_status,
+            'review_note' => $item->review_note,
+            'private_admin_note' => $item->private_admin_note,
+            'reviewed_at' => $item->reviewed_at ? $item->reviewed_at->toDateTimeString() : null,
+            'reviewed_by' => $item->reviewed_by,
+            'reviewed_by_name' => $item->reviewedBy ? $item->reviewedBy->name : null,
+            'support_tickets_count' => SupportTicket::countForUser($item->user_id),
+        ];
+    }
+}

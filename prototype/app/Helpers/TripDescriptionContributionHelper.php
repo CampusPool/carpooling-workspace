@@ -1,0 +1,184 @@
+<?php
+
+namespace STS\Helpers;
+
+use STS\Models\Trip;
+use STS\Support\TripExcessContributionStatus;
+
+/**
+ * Regex heuristic for money amounts in trip descriptions ("$24000", "$24K",
+ * "24 lucas"). Trip create/update no longer use it: descriptions are reviewed
+ * by the queued LLM check (STS\Jobs\CheckTripContributionWithLlm). It is kept
+ * because the 2026_08 backfill migrations call syncPotentialExcessContributionAttributes(),
+ * the LLM result applier reuses the average/percentage helpers, and the
+ * frontend trip-creation warning mirrors these rules
+ * (carpoolear src/utils/tripDescriptionContribution.js).
+ */
+class TripDescriptionContributionHelper
+{
+    /**
+     * @return list<int>
+     */
+    public static function extractContributionAmountsCents(string $description): array
+    {
+        $amounts = [];
+
+        if (preg_match_all(
+            '/\$\s*(\d+(?:[.,]\d+)*)\s*([kK])?/u',
+            $description,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            foreach ($matches as $match) {
+                $amounts[] = self::parseNumericAmountToCents(
+                    $match[1],
+                    ($match[2] ?? '') !== ''
+                );
+            }
+        }
+
+        if (preg_match_all(
+            '/(\d+(?:[.,]\d+)*)\s*lucas?/iu',
+            $description,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            foreach ($matches as $match) {
+                $amounts[] = self::parseNumericAmountToCents($match[1], true);
+            }
+        }
+
+        return array_values(array_unique($amounts));
+    }
+
+    public static function maxContributionAmountCents(string $description): ?int
+    {
+        $amounts = self::extractContributionAmountsCents($description);
+
+        if ($amounts === []) {
+            return null;
+        }
+
+        return max($amounts);
+    }
+
+    public static function potentialExcessContributionCents(
+        string $description,
+        int $seatPriceCents
+    ): ?int {
+        if ($seatPriceCents <= 0) {
+            return null;
+        }
+
+        $maxAmountCents = self::maxContributionAmountCents($description);
+
+        if ($maxAmountCents === null || $maxAmountCents <= $seatPriceCents) {
+            return null;
+        }
+
+        return $maxAmountCents;
+    }
+
+    public static function hasPotentialExcessContribution(
+        string $description,
+        int $seatPriceCents
+    ): bool {
+        return self::potentialExcessContributionCents($description, $seatPriceCents) !== null;
+    }
+
+    public static function averageContributionCents(Trip $trip): ?int
+    {
+        if (! $trip->recommended_trip_price_cents) {
+            return null;
+        }
+
+        return TripPriceHelper::seatPriceCentsFromTripPriceCents(
+            (int) $trip->recommended_trip_price_cents,
+            $trip->rear_max_two_passengers
+        );
+    }
+
+    public static function excessContributionPercentage(
+        ?int $askedSeatPriceCents,
+        ?int $averageContributionCents
+    ): ?int {
+        if (
+            $askedSeatPriceCents === null
+            || $averageContributionCents === null
+            || $averageContributionCents <= 0
+        ) {
+            return null;
+        }
+
+        return (int) round(
+            ($askedSeatPriceCents - $averageContributionCents) / $averageContributionCents * 100
+        );
+    }
+
+    public static function syncPotentialExcessContributionAttributes(Trip $trip): void
+    {
+        $potentialSeatPriceCents = self::potentialExcessContributionCents(
+            $trip->description ?? '',
+            (int) $trip->seat_price_cents
+        );
+
+        $trip->has_potential_excess_contribution = $potentialSeatPriceCents !== null;
+        $trip->description_potential_seat_price_cents = $potentialSeatPriceCents;
+        $trip->average_contribution_cents = self::averageContributionCents($trip);
+        $trip->excess_contribution_percentage = self::excessContributionPercentage(
+            $potentialSeatPriceCents,
+            $trip->average_contribution_cents
+        );
+
+        if ($potentialSeatPriceCents !== null) {
+            if ($trip->exceso_contribucion_status === null) {
+                $trip->exceso_contribucion_status = TripExcessContributionStatus::PENDIENTE;
+            }
+        } else {
+            $trip->exceso_contribucion_status = null;
+            $trip->average_contribution_cents = null;
+            $trip->excess_contribution_percentage = null;
+        }
+    }
+
+    private static function parseNumericAmountToCents(
+        string $raw,
+        bool $multiplyByThousands
+    ): int {
+        $pesos = (float) self::normalizeAmountString($raw);
+
+        if ($multiplyByThousands) {
+            $pesos *= 1000;
+        }
+
+        return (int) round($pesos * 100);
+    }
+
+    private static function normalizeAmountString(string $raw): string
+    {
+        $hasComma = str_contains($raw, ',');
+        $hasDot = str_contains($raw, '.');
+
+        if ($hasComma && $hasDot) {
+            $lastComma = strrpos($raw, ',');
+            $lastDot = strrpos($raw, '.');
+
+            if ($lastComma > $lastDot) {
+                $raw = str_replace('.', '', $raw);
+                $raw = str_replace(',', '.', $raw);
+            } else {
+                $raw = str_replace(',', '', $raw);
+            }
+        } elseif ($hasComma) {
+            if (preg_match('/,\d{3}$/', $raw)) {
+                $raw = str_replace(',', '', $raw);
+            } else {
+                $raw = str_replace(',', '.', $raw);
+            }
+        } elseif ($hasDot && preg_match('/\.\d{3}$/', $raw)) {
+            $raw = str_replace('.', '', $raw);
+        }
+
+        return $raw;
+    }
+}

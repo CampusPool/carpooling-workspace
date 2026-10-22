@@ -1,0 +1,1130 @@
+<?php
+
+namespace Tests\Feature\Http;
+
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Storage;
+use STS\Http\Controllers\Api\Admin\ManualIdentityValidationController;
+use STS\Http\Middleware\UserAdmin;
+use STS\Models\ManualIdentityValidation;
+use STS\Models\MercadoPagoRejectedValidation;
+use STS\Models\SupportTicket;
+use STS\Models\User;
+use STS\Notifications\ManualIdentityValidationReviewNotification;
+use STS\Services\Notifications\NotificationServices;
+use Tests\TestCase;
+
+class AdminManualIdentityValidationControllerIntegrationTest extends TestCase
+{
+    private function admin(): User
+    {
+        $user = User::factory()->create();
+        $user->forceFill(['is_admin' => true])->saveQuietly();
+
+        return $user->fresh();
+    }
+
+    public function test_index_returns_only_data_key_and_full_row_shape(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['name' => 'Manual User']);
+        ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $response = $this->getJson('api/admin/manual-identity-validations')->assertOk();
+        $this->assertArrayHasKey('data', $response->json());
+        $this->assertArrayHasKey('meta', $response->json());
+
+        $row = collect($response->json('data'))->firstWhere('user_id', $user->id);
+        $this->assertNotNull($row);
+        $this->assertSame([
+            'id',
+            'user_id',
+            'user_name',
+            'identity_validated',
+            'identity_validation_type',
+            'paid_at',
+            'submitted_at',
+            'manual_validation_started_at',
+            'paid',
+            'review_status',
+            'has_images',
+            'open_account_verification_tickets_count',
+        ], array_keys($row));
+        $this->assertSame('Manual User', $row['user_name']);
+        $this->assertFalse($row['identity_validated']);
+        $this->assertNull($row['identity_validation_type']);
+        $this->assertTrue($row['paid']);
+        $this->assertFalse($row['has_images']);
+        $this->assertSame(0, $row['open_account_verification_tickets_count']);
+    }
+
+    public function test_index_includes_user_identity_verification_fields(): void
+    {
+        $admin = $this->admin();
+        $verified = User::factory()->create([
+            'name' => 'Verified User',
+            'identity_validated' => true,
+            'identity_validation_type' => 'manual',
+        ]);
+        $unverified = User::factory()->create(['name' => 'Unverified User']);
+
+        foreach ([$verified, $unverified] as $user) {
+            ManualIdentityValidation::create([
+                'user_id' => $user->id,
+                'paid' => true,
+                'paid_at' => now(),
+                'submitted_at' => now(),
+                'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+            ]);
+        }
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $rows = collect($this->getJson('api/admin/manual-identity-validations')->assertOk()->json('data'));
+
+        $verifiedRow = $rows->firstWhere('user_id', $verified->id);
+        $this->assertNotNull($verifiedRow);
+        $this->assertTrue($verifiedRow['identity_validated']);
+        $this->assertSame('manual', $verifiedRow['identity_validation_type']);
+
+        $unverifiedRow = $rows->firstWhere('user_id', $unverified->id);
+        $this->assertNotNull($unverifiedRow);
+        $this->assertFalse($unverifiedRow['identity_validated']);
+        $this->assertNull($unverifiedRow['identity_validation_type']);
+    }
+
+    public function test_index_includes_open_account_verification_ticket_counts(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['name' => 'Ticket User']);
+        ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'account_verification',
+            'subject' => 'Open verification',
+            'status' => 'Open',
+            'priority' => 'high',
+            'created_by' => $admin->id,
+        ]);
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'account_verification',
+            'subject' => 'User opened verification',
+            'status' => 'Open',
+            'priority' => 'high',
+            'created_by' => $user->id,
+        ]);
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'account_verification',
+            'subject' => 'Closed verification',
+            'status' => 'Cerrado',
+            'priority' => 'high',
+            'created_by' => $admin->id,
+        ]);
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'contact',
+            'subject' => 'Other type',
+            'status' => 'Open',
+            'priority' => 'normal',
+            'created_by' => $admin->id,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $row = collect($this->getJson('api/admin/manual-identity-validations')->assertOk()->json('data'))
+            ->firstWhere('user_id', $user->id);
+
+        $this->assertNotNull($row);
+        $this->assertSame(1, $row['open_account_verification_tickets_count']);
+    }
+
+    public function test_index_paginates_with_default_hundred_per_page(): void
+    {
+        $admin = $this->admin();
+
+        for ($i = 0; $i < 22; $i++) {
+            $user = User::factory()->create();
+            ManualIdentityValidation::create([
+                'user_id' => $user->id,
+                'paid' => true,
+                'paid_at' => now(),
+                'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+            ]);
+        }
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->getJson('api/admin/manual-identity-validations')
+            ->assertOk()
+            ->assertJsonPath('meta.pagination.per_page', 100)
+            ->assertJsonPath('meta.pagination.current_page', 1)
+            ->assertJsonPath('meta.pagination.total', 22)
+            ->assertJsonCount(22, 'data');
+    }
+
+    public function test_index_excludes_resolved_rows_unless_show_resolved_is_true(): void
+    {
+        $admin = $this->admin();
+        $pendingUser = User::factory()->create();
+        $approvedUser = User::factory()->create();
+
+        ManualIdentityValidation::create([
+            'user_id' => $pendingUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+        ManualIdentityValidation::create([
+            'user_id' => $approvedUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_APPROVED,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $defaultIds = collect($this->getJson('api/admin/manual-identity-validations')->json('data'))
+            ->pluck('user_id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $this->assertContains($pendingUser->id, $defaultIds);
+        $this->assertNotContains($approvedUser->id, $defaultIds);
+
+        $resolvedIds = collect($this->getJson('api/admin/manual-identity-validations?show_resolved=1')->json('data'))
+            ->pluck('user_id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $this->assertContains($pendingUser->id, $resolvedIds);
+        $this->assertContains($approvedUser->id, $resolvedIds);
+    }
+
+    public function test_index_treats_closed_rows_as_resolved(): void
+    {
+        $admin = $this->admin();
+        $pendingUser = User::factory()->create();
+        $closedUser = User::factory()->create();
+
+        ManualIdentityValidation::create([
+            'user_id' => $pendingUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+        ManualIdentityValidation::create([
+            'user_id' => $closedUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_CLOSED,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $defaultIds = collect($this->getJson('api/admin/manual-identity-validations')->json('data'))
+            ->pluck('user_id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $this->assertContains($pendingUser->id, $defaultIds);
+        $this->assertNotContains($closedUser->id, $defaultIds);
+
+        $resolvedIds = collect($this->getJson('api/admin/manual-identity-validations?show_resolved=1')->json('data'))
+            ->pluck('user_id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $this->assertContains($pendingUser->id, $resolvedIds);
+        $this->assertContains($closedUser->id, $resolvedIds);
+    }
+
+    public function test_index_sorts_by_open_account_verification_tickets_count_desc(): void
+    {
+        $admin = $this->admin();
+        $userNone = User::factory()->create(['name' => 'No Tickets']);
+        $userOne = User::factory()->create(['name' => 'One Ticket']);
+        $userTwo = User::factory()->create(['name' => 'Two Tickets']);
+
+        $rowNone = ManualIdentityValidation::create([
+            'user_id' => $userNone->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+        $rowOne = ManualIdentityValidation::create([
+            'user_id' => $userOne->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+        $rowTwo = ManualIdentityValidation::create([
+            'user_id' => $userTwo->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        SupportTicket::create([
+            'user_id' => $userOne->id,
+            'type' => 'account_verification',
+            'subject' => 'One open ticket',
+            'status' => 'Open',
+            'priority' => 'high',
+            'created_by' => $admin->id,
+        ]);
+        SupportTicket::create([
+            'user_id' => $userTwo->id,
+            'type' => 'account_verification',
+            'subject' => 'Two open tickets A',
+            'status' => 'Open',
+            'priority' => 'high',
+            'created_by' => $admin->id,
+        ]);
+        SupportTicket::create([
+            'user_id' => $userTwo->id,
+            'type' => 'account_verification',
+            'subject' => 'Two open tickets B',
+            'status' => 'Esperando respuesta',
+            'priority' => 'high',
+            'created_by' => $admin->id,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $ids = collect(
+            $this->getJson(
+                'api/admin/manual-identity-validations?sort=open_account_verification_tickets_count&direction=desc&show_resolved=1'
+            )->assertOk()->json('data')
+        )->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+        $this->assertSame([$rowTwo->id, $rowOne->id, $rowNone->id], array_slice($ids, 0, 3));
+    }
+
+    public function test_index_sorts_by_open_account_verification_tickets_count_then_workflow_state(): void
+    {
+        $admin = $this->admin();
+        $unpaidUser = User::factory()->create(['name' => 'Unpaid']);
+        $awaitingPhotosUser = User::factory()->create(['name' => 'Awaiting Photos']);
+        $pendingReviewUser = User::factory()->create(['name' => 'Pending Review']);
+
+        $unpaidRow = ManualIdentityValidation::create([
+            'user_id' => $unpaidUser->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+        $awaitingPhotosRow = ManualIdentityValidation::create([
+            'user_id' => $awaitingPhotosUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_AWAITING_PHOTOS,
+        ]);
+        $pendingReviewRow = ManualIdentityValidation::create([
+            'user_id' => $pendingReviewUser->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        foreach ([$unpaidUser, $awaitingPhotosUser, $pendingReviewUser] as $user) {
+            SupportTicket::create([
+                'user_id' => $user->id,
+                'type' => 'account_verification',
+                'subject' => 'Shared ticket count',
+                'status' => 'Open',
+                'priority' => 'high',
+                'created_by' => $admin->id,
+            ]);
+        }
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $ids = collect(
+            $this->getJson(
+                'api/admin/manual-identity-validations?sort=open_account_verification_tickets_count&direction=asc&show_resolved=1'
+            )->assertOk()->json('data')
+        )->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+        $this->assertSame(
+            [$unpaidRow->id, $awaitingPhotosRow->id, $pendingReviewRow->id],
+            array_slice($ids, 0, 3)
+        );
+    }
+
+    public function test_index_sorts_by_id_across_pages_not_only_within_page(): void
+    {
+        $admin = $this->admin();
+        $rows = [];
+
+        for ($i = 1; $i <= 25; $i++) {
+            $user = User::factory()->create();
+            $rows[] = ManualIdentityValidation::create([
+                'user_id' => $user->id,
+                'paid' => true,
+                'paid_at' => now(),
+                'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+            ]);
+        }
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $pageOneIds = collect(
+            $this->getJson('api/admin/manual-identity-validations?sort=id&direction=desc&per_page=10&page=1')
+                ->assertOk()
+                ->json('data')
+        )->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+        $pageTwoIds = collect(
+            $this->getJson('api/admin/manual-identity-validations?sort=id&direction=desc&per_page=10&page=2')
+                ->assertOk()
+                ->json('data')
+        )->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+        $this->assertCount(10, $pageOneIds);
+        $this->assertCount(10, $pageTwoIds);
+        $this->assertSame(max($pageOneIds), $pageOneIds[0]);
+        $this->assertTrue(min($pageOneIds) > max($pageTwoIds));
+    }
+
+    public function test_show_builds_image_urls_from_rtrimmed_app_url_without_double_slash(): void
+    {
+        Config::set('app.url', 'https://app.example.com/');
+
+        $admin = $this->admin();
+        $user = User::factory()->create(['nro_doc' => '11222333']);
+        $reviewer = User::factory()->create(['name' => 'Reviewer Admin']);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => 'idv/front.jpg',
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+            'reviewed_by' => $reviewer->id,
+            'reviewed_at' => now(),
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $data = $this->getJson('api/admin/manual-identity-validations/'.$row->id)->assertOk()->json('data');
+
+        $expectedBase = 'https://app.example.com';
+        $this->assertSame(
+            $expectedBase.'/api/admin/manual-identity-validations/'.$row->id.'/image/front',
+            $data['front_image_url']
+        );
+        $this->assertNull($data['back_image_url']);
+        $this->assertSame('Reviewer Admin', $data['reviewed_by_name']);
+    }
+
+    public function test_image_invalid_type_returns_json_not_found_with_exact_payload(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+
+        $response = app(ManualIdentityValidationController::class)->image($row->id, 'invalid-type');
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame(404, $response->getStatusCode());
+        $this->assertSame(['error' => 'Invalid image type'], $response->getData(true));
+    }
+
+    public function test_image_returns_not_found_when_column_empty_or_file_missing(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->getJson('api/admin/manual-identity-validations/'.$row->id.'/image/front')
+            ->assertNotFound()
+            ->assertJson(['error' => 'Image not found']);
+    }
+
+    public function test_image_streams_existing_file_with_inline_disposition(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $relative = 'manual-idv/test-front.bin';
+        Storage::disk('local')->put($relative, 'fake-image-bytes');
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => $relative,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $response = $this->get('api/admin/manual-identity-validations/'.$row->id.'/image/front');
+        $response->assertOk();
+        $response->assertHeader('Content-Disposition', 'inline');
+        $this->assertStringContainsString('fake-image-bytes', (string) $response->streamedContent());
+    }
+
+    public function test_review_rejects_unpaid_request_and_approves_paid_updates_user(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+
+        $unpaid = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$unpaid->id.'/review', [
+            'action' => 'approve',
+        ])->assertUnprocessable()->assertJsonPath('error', 'Unpaid request cannot be reviewed');
+
+        $paid = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$paid->id.'/review', [
+            'action' => 'approve',
+        ])->assertOk()->assertJsonPath('data.review_status', 'approved');
+
+        $user->refresh();
+        $this->assertTrue((bool) $user->identity_validated);
+        $this->assertSame('manual', (string) $user->identity_validation_type);
+    }
+
+    public function test_review_approve_clears_prior_rejection_state(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create([
+            'identity_validated' => false,
+            'identity_validation_rejected_at' => now()->subDay(),
+            'identity_validation_reject_reason' => 'dni_mismatch',
+        ]);
+
+        $rejectedManual = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now()->subDays(2),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_REJECTED,
+            'review_note' => 'Old rejection.',
+        ]);
+
+        MercadoPagoRejectedValidation::create([
+            'user_id' => $user->id,
+            'reject_reason' => 'name_mismatch',
+            'mp_payload' => ['first_name' => 'Jane'],
+        ]);
+
+        $paid = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$paid->id.'/review', [
+            'action' => 'approve',
+        ])->assertOk()->assertJsonPath('data.review_status', 'approved');
+
+        $user->refresh();
+        $this->assertTrue((bool) $user->identity_validated);
+        $this->assertNull($user->identity_validation_rejected_at);
+        $this->assertNull($user->identity_validation_reject_reason);
+        $this->assertDatabaseMissing('manual_identity_validations', ['id' => $rejectedManual->id]);
+        $this->assertDatabaseHas('manual_identity_validations', ['id' => $paid->id, 'review_status' => 'approved']);
+        $this->assertSame(0, MercadoPagoRejectedValidation::query()->where('user_id', $user->id)->count());
+    }
+
+    public function test_review_reject_clears_identity_on_user_row_in_database(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create([
+            'identity_validated' => true,
+            'identity_validated_at' => now(),
+            'identity_validation_type' => 'manual',
+        ]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/review', [
+            'action' => 'reject',
+            'note' => 'Illegible documents.',
+            'reject_reason' => 'docs_illegible',
+        ])->assertOk()->assertJsonPath('data.review_status', 'rejected');
+
+        $fromDb = User::query()->findOrFail($user->id);
+        $this->assertFalse((bool) $fromDb->identity_validated);
+        $this->assertNull($fromDb->identity_validated_at);
+        $this->assertNull($fromDb->identity_validation_type);
+    }
+
+    public function test_purge_deletes_stored_files_and_clears_paths(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+
+        $front = 'idv/purge-front.jpg';
+        Storage::disk('local')->put($front, 'x');
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => $front,
+            'back_image_path' => null,
+            'selfie_image_path' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/purge')
+            ->assertOk()
+            ->assertJsonPath('message', 'Photos purged');
+
+        $this->assertFalse(Storage::disk('local')->exists($front));
+        $fresh = ManualIdentityValidation::query()->findOrFail($row->id);
+        $this->assertNull($fresh->front_image_path);
+    }
+
+    public function test_show_reports_images_not_purged_when_paid_without_submitted_images(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->getJson('api/admin/manual-identity-validations/'.$row->id)
+            ->assertOk()
+            ->assertJsonPath('data.has_images', false)
+            ->assertJsonPath('data.images_purged_at', null);
+    }
+
+    public function test_purge_sets_images_purged_at(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+
+        $front = 'idv/purge-front.jpg';
+        Storage::disk('local')->put($front, 'x');
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => $front,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/purge')
+            ->assertOk();
+
+        $fresh = ManualIdentityValidation::query()->findOrFail($row->id);
+        $this->assertNotNull($fresh->images_purged_at);
+    }
+
+    public function test_show_reports_images_purged_after_admin_purge(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+
+        $front = 'idv/purge-front.jpg';
+        Storage::disk('local')->put($front, 'x');
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'front_image_path' => $front,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/purge')->assertOk();
+
+        $this->getJson('api/admin/manual-identity-validations/'.$row->id)
+            ->assertOk()
+            ->assertJsonPath('data.has_images', false)
+            ->assertJsonPath('data.images_purged_at', fn ($value) => $value !== null);
+    }
+
+    public function test_private_note_endpoint_updates_field_and_show_returns_it(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/private-note', [
+            'private_admin_note' => 'Internal follow-up next week.',
+        ])->assertOk()->assertJsonPath('data.private_admin_note', 'Internal follow-up next week.');
+
+        $show = $this->getJson('api/admin/manual-identity-validations/'.$row->id)->assertOk();
+        $this->assertSame('Internal follow-up next week.', $show->json('data.private_admin_note'));
+    }
+
+    public function test_review_approve_notifies_user_with_approved_action(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->mock(NotificationServices::class, function ($mock) use ($user) {
+            $mock->shouldReceive('send')
+                ->twice()
+                ->withArgs(function ($notification, $recipient, $channel) use ($user) {
+                    if (! $notification instanceof ManualIdentityValidationReviewNotification) {
+                        return false;
+                    }
+                    if ($notification->getAttribute('action') !== 'approved') {
+                        return false;
+                    }
+                    if (! $recipient instanceof User || (int) $recipient->id !== (int) $user->id) {
+                        return false;
+                    }
+
+                    return in_array($channel, [
+                        \STS\Services\Notifications\Channels\DatabaseChannel::class,
+                        \STS\Services\Notifications\Channels\PushChannel::class,
+                    ], true);
+                });
+        });
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/review', [
+            'action' => 'approve',
+            'note' => 'Documentación correcta.',
+        ])->assertOk();
+    }
+
+    public function test_review_reject_notifies_user_with_rejected_action(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->mock(NotificationServices::class, function ($mock) use ($user) {
+            $mock->shouldReceive('send')
+                ->twice()
+                ->withArgs(function ($notification, $recipient, $channel) use ($user) {
+                    if (! $notification instanceof ManualIdentityValidationReviewNotification) {
+                        return false;
+                    }
+                    if ($notification->getAttribute('action') !== 'rejected') {
+                        return false;
+                    }
+                    if (! $recipient instanceof User || (int) $recipient->id !== (int) $user->id) {
+                        return false;
+                    }
+
+                    return in_array($channel, [
+                        \STS\Services\Notifications\Channels\DatabaseChannel::class,
+                        \STS\Services\Notifications\Channels\PushChannel::class,
+                    ], true);
+                });
+        });
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/review', [
+            'action' => 'reject',
+            'note' => 'Fotos ilegibles.',
+            'reject_reason' => 'docs_illegible',
+        ])->assertOk();
+    }
+
+    public function test_review_pending_does_not_notify_user(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->mock(NotificationServices::class, function ($mock) {
+            $mock->shouldReceive('send')->never();
+        });
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/review', [
+            'action' => 'pending',
+            'note' => 'Necesitamos mejor calidad.',
+        ])->assertOk();
+    }
+
+    public function test_update_state_clearing_photos_submitted_nulls_date_and_deletes_files(): void
+    {
+        Storage::fake('local');
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $front = 'idv/state-clear-front.jpg';
+        Storage::disk('local')->put($front, 'x');
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now()->subDay(),
+            'front_image_path' => $front,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'photos_submitted' => false,
+        ])->assertOk()
+            ->assertJsonPath('data.submitted_at', null)
+            ->assertJsonPath('data.review_status', ManualIdentityValidation::REVIEW_STATUS_AWAITING_PHOTOS);
+
+        $this->assertFalse(Storage::disk('local')->exists($front));
+        $fresh = ManualIdentityValidation::query()->findOrFail($row->id);
+        $this->assertNull($fresh->submitted_at);
+        $this->assertNull($fresh->front_image_path);
+    }
+
+    public function test_update_state_setting_photos_submitted_sets_submitted_at(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'photos_submitted' => true,
+        ])->assertOk()
+            ->assertJsonPath('data.submitted_at', fn ($value) => $value !== null)
+            ->assertJsonPath('data.review_status', ManualIdentityValidation::REVIEW_STATUS_PENDING);
+
+        $fresh = ManualIdentityValidation::query()->findOrFail($row->id);
+        $this->assertNotNull($fresh->submitted_at);
+    }
+
+    public function test_update_state_sets_paid_and_paid_at_when_marking_paid(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => false,
+            'paid_at' => null,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'paid' => true,
+        ])->assertOk()->assertJsonPath('data.paid', true);
+
+        $fresh = ManualIdentityValidation::query()->findOrFail($row->id);
+        $this->assertTrue($fresh->paid);
+        $this->assertNotNull($fresh->paid_at);
+    }
+
+    public function test_update_state_reject_clears_user_identity(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create([
+            'identity_validated' => true,
+            'identity_validated_at' => now(),
+            'identity_validation_type' => 'manual',
+        ]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_APPROVED,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'review_status' => 'rejected',
+        ])->assertOk()->assertJsonPath('data.review_status', 'rejected');
+
+        $user->refresh();
+        $this->assertFalse((bool) $user->identity_validated);
+        $this->assertNull($user->identity_validated_at);
+        $this->assertNull($user->identity_validation_type);
+    }
+
+    public function test_update_state_does_not_notify_user(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->mock(NotificationServices::class, function ($mock) {
+            $mock->shouldReceive('send')->never();
+        });
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'review_status' => 'approved',
+        ])->assertOk();
+    }
+
+    public function test_update_state_sets_review_status_and_syncs_user_on_approve(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'review_status' => 'approved',
+        ])->assertOk()->assertJsonPath('data.review_status', 'approved');
+
+        $user->refresh();
+        $this->assertTrue((bool) $user->identity_validated);
+        $this->assertSame('manual', (string) $user->identity_validation_type);
+    }
+
+    public function test_update_state_accepts_closed_without_changing_user_identity(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create([
+            'identity_validated' => true,
+            'identity_validated_at' => now(),
+            'identity_validation_type' => 'mercado_pago',
+        ]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_CLOSED,
+        ])->assertOk()->assertJsonPath('data.review_status', ManualIdentityValidation::REVIEW_STATUS_CLOSED);
+
+        $user->refresh();
+        $this->assertTrue((bool) $user->identity_validated);
+        $this->assertSame('mercado_pago', (string) $user->identity_validation_type);
+        $this->assertDatabaseHas('manual_identity_validations', [
+            'id' => $row->id,
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_CLOSED,
+        ]);
+    }
+
+    public function test_show_includes_support_tickets_count_for_user(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create();
+        $adminCreator = User::factory()->create(['is_admin' => true]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'account_verification',
+            'subject' => 'User opened ticket',
+            'status' => 'Open',
+            'priority' => 'high',
+        ]);
+        SupportTicket::create([
+            'user_id' => $user->id,
+            'type' => 'contact',
+            'subject' => 'Admin opened ticket',
+            'status' => 'Open',
+            'priority' => 'normal',
+            'created_by' => $adminCreator->id,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $data = $this->getJson('api/admin/manual-identity-validations/'.$row->id)->assertOk()->json('data');
+
+        $this->assertArrayHasKey('support_tickets_count', $data);
+        $this->assertSame(2, $data['support_tickets_count']);
+    }
+
+    public function test_review_returns_reviewed_by_name_of_acting_admin(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $data = $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/review', [
+            'action' => 'approve',
+        ])->assertOk()->json('data');
+
+        $this->assertSame($admin->id, (int) $data['reviewed_by']);
+        $this->assertSame($admin->name, $data['reviewed_by_name']);
+        $this->assertNotNull($data['reviewed_at']);
+    }
+
+    public function test_update_state_review_status_returns_reviewed_by_name_of_acting_admin(): void
+    {
+        $admin = $this->admin();
+        $user = User::factory()->create(['identity_validated' => false]);
+        $row = ManualIdentityValidation::create([
+            'user_id' => $user->id,
+            'paid' => true,
+            'paid_at' => now(),
+            'submitted_at' => now(),
+            'review_status' => ManualIdentityValidation::REVIEW_STATUS_PENDING,
+        ]);
+
+        $this->actingAs($admin, 'api');
+        $this->withoutMiddleware(UserAdmin::class);
+
+        $data = $this->postJson('api/admin/manual-identity-validations/'.$row->id.'/state', [
+            'review_status' => 'rejected',
+        ])->assertOk()->json('data');
+
+        $this->assertSame($admin->id, (int) $data['reviewed_by']);
+        $this->assertSame($admin->name, $data['reviewed_by_name']);
+        $this->assertSame('rejected', $data['review_status']);
+    }
+}
