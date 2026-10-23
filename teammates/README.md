@@ -1,26 +1,24 @@
-# CampusPool teammate workspace
+# Sprint 1 teammate handoff
 
-This directory contains **task instructions only**. All four contributors edit the one shared application under [`../prototype/`](../prototype/)—do not create four copies of source code.
+**Official SE + DBMS repository:** [CampusPool/carpooling](https://github.com/CampusPool/carpooling) (issues, sprint plan, final source and submission).  
+**Working repository:** [CampusPool/carpooling-workspace](https://github.com/CampusPool/carpooling-workspace) (prototype and teammate PRs).
 
-**Start point:** [private import PR #1](https://github.com/CampusPool/carpooling-workspace/pull/1) is currently a draft. Until reviewed and merged, checkout its branch explicitly; after merge, branch from the approved `main`.
+| Contributor | Sprint 1 issues | Story points | Instructions |
+|---|---|---:|---|
+| Arjun | [#23](https://github.com/CampusPool/carpooling/issues/23), [#39](https://github.com/CampusPool/carpooling/issues/39), [#44](https://github.com/CampusPool/carpooling/issues/44) | 11 | [Arjun](arjun/README.md) — booking, CI and evidence |
+| Zayaan | [#12](https://github.com/CampusPool/carpooling/issues/12), [#21](https://github.com/CampusPool/carpooling/issues/21) | 10 | [Zayaan](zayaan/README.md) — offer UI and map fallback |
+| Nikhil | [#22](https://github.com/CampusPool/carpooling/issues/22), [#43](https://github.com/CampusPool/carpooling/issues/43) | 10 | [Nikhil](nikhil/README.md) — matching and testing |
+| Nithesh | [#24](https://github.com/CampusPool/carpooling/issues/24), [#37](https://github.com/CampusPool/carpooling/issues/37) | 10 | [Nithesh](nithesh/README.md) — cancellation and DB integrity |
 
-1. Clone the private [workspace](https://github.com/CampusPool/carpooling-workspace), then switch to the approved baseline.
-2. Read your own `teammates/<folder>/README.md` and corresponding [official issues](https://github.com/CampusPool/carpooling/issues).
-3. Create the assigned `s1/...` branch. Do **not** push commits directly to `main`.
-4. Make substantive, personally understood fixes/tests, and open a PR **in this private workspace**. Use full links to official issues; never claim an imported baseline as independently authored work.
-5. Include commands, passing/failing results, and evidence in your PR. Request human review; merge only after approval.
+## Workflow
 
-**Important:** Carpoolear GPLv3 code and mixed-provenance extensions are included and attributed. Academic originality approval is still unconfirmed. Never commit passwords, private keys, database dumps, reference captures, or fabricated contribution history. Use synthetic data and disposable test databases.
+1. Clone **the whole workspace repository**, not a `teammates/` subfolder. These folders contain task instructions, not separate applications.
+2. Run the [portable demo](../prototype/reproduction/PORTABLE_DEMO.md) from `prototype/` and read your own task packet.
+3. Create a personal `s1/...` branch from current workspace `main`. The old `import/sprint1-attributed-sanitized` branch was already merged.
+4. Make and test a **real** code/test change in your assigned area. Commit only your actual files; do not recreate the imported baseline.
+5. Push to `CampusPool/carpooling-workspace` and open a concise PR to its `main`, linking full issue URLs in the official repository.
+6. Get a teammate review. Accepted code is later synchronized to `CampusPool/carpooling` for the official submission.
 
-**Routing note:** the verified reproduction suite uses synthetic routes. Live OSRM/Maps requires separate approved configuration, not bundled provider keys. Initial Docker/Composer verification can be resource-intensive.
+**Demo:** `cd prototype && sh reproduction/start-local.sh`, then `http://127.0.0.1:18180/mobility/?demo=campus-route`. It uses synthetic routing and demo credits, not live traffic or real money.
 
-## Assignments
-
-| Folder | GitHub account | Sprint 1 focus |
-|---|---|---|
-| [arjun](arjun/README.md) | `arjunsrikanthh` | Booking and integration |
-| [zayaan](zayaan/README.md) | `zayaan-06` | Interface and offer flow |
-| [nikhil](nikhil/README.md) | `NikhilJoshi441` | Matching and pickup |
-| [nithesh](nithesh/README.md) | `NitheshMogaveer777` | Cancellation, SQL tests and CI |
-
-`noqtar` and `arjunsrikanthh` belong to the same person, not two contributors.
+Upstream Carpoolear GPLv3 sources must remain attributed. Never claim inherited files as original student work, fabricate contribution history, or commit secrets, generated dependencies or database dumps. GitHub repository visibility is controlled by Settings, regardless of any “private” text in a description.
