@@ -1,51 +1,43 @@
-# NikhilJoshi441 — Sprint 1 task packet
+# Nikhil — Sprint 1
 
-**Focus:** Ride search, matching, route and pickup boundaries
+**GitHub:** @NikhilJoshi441 · **Issues:** [#22](https://github.com/CampusPool/carpooling/issues/22), [#43](https://github.com/CampusPool/carpooling/issues/43) · **Focus:** Ride search and Test Plan execution
 
-**Official issues:** [#22](https://github.com/CampusPool/carpooling/issues/22)
-
-**Branch:** `s1/nikhil-matching`
-
-## Before you begin
-
-Do not duplicate the project or copy the imported baseline into a personal subfolder. From the workspace repo root:
+## Start and submit
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
 
 ```sh
-git fetch origin
-git switch import/sprint1-attributed-sanitized  # until private PR #1 is reviewed and merged
+git clone https://github.com/CampusPool/carpooling-workspace.git
+cd carpooling-workspace
+git switch main
+git pull --ff-only origin main
 git switch -c s1/nikhil-matching
+cd prototype
+sh reproduction/start-local.sh
+# http://127.0.0.1:18180/mobility/?demo=campus-route
+python3 reproduction/smoke-booking.py
+sh reproduction/stop-local.sh
 ```
 
-After PR #1 is merged, start new work from updated `main` instead. If this feature branch was made earlier, rebase it carefully onto approved main.
+If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
 
-## Existing code to inspect
+## Assigned work
 
-The paths below exist in the shared root; directory ownership is advisory, not a reason to copy code.
-- `prototype/campuspool-extension/Mobility/Commute/CommuteMatchingService.php`
-- `prototype/campuspool-extension/Mobility/Routing/`
-- `prototype/campuspool-extension/Mobility/Pickup/`
-- `prototype/campuspool-extension/tests/MobilityRoutingQuoteTest.php`
+1. Test date/direction/vehicle mismatches, full or unpublished offers, stale quotes and route-provider failures.
+2. Record results against the approved Test Plan; coordinate booking and cancellation tests with the respective owners.
+3. Fix a confirmed matching defect only within the matching module; document unsupported cases.
 
-## Actual contribution required
+**Relevant code:** `prototype/campuspool-extension/Mobility/Commute/CommuteMatchingService.php`, `prototype/campuspool-extension/Mobility/Routing/`, `prototype/tests/extension/`, `prototype/campuspool-extension/tests/`
 
-1. Add isolated tests for out-of-window, incompatible, full and unpublished offers.
-2. Verify walking limits, route provider failure and stale quote/profile behavior.
-3. Keep matching changes separate from the booking authority in CommuteService.php.
+**Verification:** Run the isolated relevant backend tests, then `cd prototype && sh reproduction/verify-package.sh` where available.
 
-## Verification
-
-The full verifier creates and removes **its own** temporary Docker Compose database/volume and must never be pointed at the original running MobilityPlatform database.
+## Pull request
+Commit only files you **actually change** and any associated tests; don't re-add the imported Carpoolear backend or generated `vendor/` files.
 
 ```sh
-cd prototype && sh reproduction/verify-package.sh
+git status --short
+git add <your-changed-files>
+git commit -m "test: cover ride matching boundaries"
+git push -u origin s1/nikhil-matching
 ```
 
-## PR handoff
-
-- Submit a **real change**, not a commit containing only unchanged copied code.
-- Suggested PR title: `test: cover route matching boundaries and failures`.
-- Link the full official issue URLs and distinguish satisfied criteria from remaining ones.
-- Supply tests run, test output and reproducible evidence.
-- Never mark the entire issue Done if other acceptance criteria remain unfinished.
-- Coordinate edits to shared controllers/routes/migrations with the responsible owner.
-- Request an independent teammate review before merge.
+Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
