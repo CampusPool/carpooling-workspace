@@ -18,6 +18,9 @@ cp config/.env.example reproduction/package.env
 mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs storage/suburbs storage/geojson bootstrap/cache
 cleanup() {
   status=$?
+  if [ "$status" -ne 0 ]; then
+    docker compose -f reproduction/compose.yml logs --no-color --tail=150 migrate mysql >&2 || true
+  fi
   if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     # Dependencies run as root in Docker; remove generated files INSIDE this
     # isolated package mount, never via a cross-device host mv/chown.
