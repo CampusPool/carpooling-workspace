@@ -16,6 +16,7 @@ sh reproduction/start-local.sh
 # http://127.0.0.1:18180/mobility/?demo=campus-route
 python3 reproduction/smoke-booking.py
 sh reproduction/stop-local.sh
+cd ..  # back to repository root
 ```
 
 If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
@@ -35,7 +36,9 @@ Commit only files you **actually change** and any associated tests; don't re-add
 
 ```sh
 git status --short
-git add <your-changed-files>
+git add -p  # review and stage only your changed tracked lines
+# Also use git add on any new test files you created, specifying their exact paths.
+git diff --cached --stat
 git commit -m "fix: handle commute map failures clearly"
 git push -u origin s1/zayaan-web-commute
 ```
