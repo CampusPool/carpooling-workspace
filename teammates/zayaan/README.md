@@ -1,53 +1,43 @@
-# zayaan-06 — Sprint 1 task packet
+# Zayaan — Sprint 1
 
-**Focus:** Driver/rider interface, pickup consent and Maps failure states
+**GitHub:** @zayaan-06 · **Issues:** [#12](https://github.com/CampusPool/carpooling/issues/12), [#21](https://github.com/CampusPool/carpooling/issues/21) · **Focus:** Driver details, ride offers and browser UX
 
-**Official issues:** [#12](https://github.com/CampusPool/carpooling/issues/12), [#21](https://github.com/CampusPool/carpooling/issues/21)
-
-**Branch:** `s1/zayaan-web-commute`
-
-## Before you begin
-
-Do not duplicate the project or copy the imported baseline into a personal subfolder. From the workspace repo root:
+## Start and submit
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
 
 ```sh
-git fetch origin
-git switch import/sprint1-attributed-sanitized  # until private PR #1 is reviewed and merged
+git clone https://github.com/CampusPool/carpooling-workspace.git
+cd carpooling-workspace
+git switch main
+git pull --ff-only origin main
 git switch -c s1/zayaan-web-commute
+cd prototype
+sh reproduction/start-local.sh
+# http://127.0.0.1:18180/mobility/?demo=campus-route
+python3 reproduction/smoke-booking.py
+sh reproduction/stop-local.sh
 ```
 
-After PR #1 is merged, start new work from updated `main` instead. If this feature branch was made earlier, rebase it carefully onto approved main.
+If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
 
-## Existing code to inspect
+## Assigned work
 
-The paths below exist in the shared root; directory ownership is advisory, not a reason to copy code.
-- `prototype/campuspool-extension/web/commute.mjs`
-- `prototype/campuspool-extension/web/commute-map.mjs`
-- `prototype/campuspool-extension/web/commute.html`
-- `prototype/campuspool-extension/web/commute.css`
-- `prototype/tests/frontend/test-commute-ui.mjs`
-- `prototype/tests/frontend/test-commute-map.mjs`
+1. When the map provider is unavailable, show a useful text route/pickup summary, not just a failure message.
+2. Test car/bike offer form validation and driver/rider journey status on small/desktop screens.
+3. Add focused frontend tests and a sanitized screenshot of the changed behavior.
 
-## Actual contribution required
+**Relevant code:** `prototype/campuspool-extension/web/commute.mjs`, `prototype/campuspool-extension/web/commute-map.mjs`, `prototype/campuspool-extension/web/commute.html`, `prototype/campuspool-extension/web/commute.css`, `prototype/tests/frontend/`
 
-1. Keep fare, pickup and walking consent readable if Maps fails.
-2. Validate car/bike offer forms, errors, and pending/accepted/cancelled UI states.
-3. Add genuine UI regression tests and attach sanitized screenshots for behavior changed.
+**Verification:** From `prototype/`, run `node --test tests/frontend/test-commute-ui.mjs tests/frontend/test-commute-map.mjs tests/frontend/test-place-search.mjs`.
 
-## Verification
-
-The full verifier creates and removes **its own** temporary Docker Compose database/volume and must never be pointed at the original running MobilityPlatform database.
+## Pull request
+Commit only files you **actually change** and any associated tests; don't re-add the imported Carpoolear backend or generated `vendor/` files.
 
 ```sh
-cd prototype && node --test tests/frontend/test-commute-ui.mjs tests/frontend/test-commute-map.mjs tests/frontend/test-place-search.mjs
+git status --short
+git add <your-changed-files>
+git commit -m "fix: handle commute map failures clearly"
+git push -u origin s1/zayaan-web-commute
 ```
 
-## PR handoff
-
-- Submit a **real change**, not a commit containing only unchanged copied code.
-- Suggested PR title: `fix: improve commute forms and map failure states`.
-- Link the full official issue URLs and distinguish satisfied criteria from remaining ones.
-- Supply tests run, test output and reproducible evidence.
-- Never mark the entire issue Done if other acceptance criteria remain unfinished.
-- Coordinate edits to shared controllers/routes/migrations with the responsible owner.
-- Request an independent teammate review before merge.
+Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
