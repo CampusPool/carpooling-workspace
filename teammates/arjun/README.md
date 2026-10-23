@@ -1,51 +1,43 @@
-# arjunsrikanthh — Sprint 1 task packet
+# Arjun — Sprint 1
 
-**Focus:** Booking authorization, release coordination and last-seat contention
+**GitHub:** @arjunsrikanthh · **Issues:** [#23](https://github.com/CampusPool/carpooling/issues/23), [#39](https://github.com/CampusPool/carpooling/issues/39), [#44](https://github.com/CampusPool/carpooling/issues/44) · **Focus:** Booking correctness, CI and demo evidence
 
-**Official issues:** [#23](https://github.com/CampusPool/carpooling/issues/23), [#44](https://github.com/CampusPool/carpooling/issues/44), [#37](https://github.com/CampusPool/carpooling/issues/37)
-
-**Branch:** `s1/arjun-booking-release`
-
-## Before you begin
-
-Do not duplicate the project or copy the imported baseline into a personal subfolder. From the workspace repo root:
+## Start and submit
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
 
 ```sh
-git fetch origin
-git switch import/sprint1-attributed-sanitized  # until private PR #1 is reviewed and merged
+git clone https://github.com/CampusPool/carpooling-workspace.git
+cd carpooling-workspace
+git switch main
+git pull --ff-only origin main
 git switch -c s1/arjun-booking-release
+cd prototype
+sh reproduction/start-local.sh
+# http://127.0.0.1:18180/mobility/?demo=campus-route
+python3 reproduction/smoke-booking.py
+sh reproduction/stop-local.sh
 ```
 
-After PR #1 is merged, start new work from updated `main` instead. If this feature branch was made earlier, rebase it carefully onto approved main.
+If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
 
-## Existing code to inspect
+## Assigned work
 
-The paths below exist in the shared root; directory ownership is advisory, not a reason to copy code.
-- `prototype/campuspool-extension/Mobility/Commute/CommuteService.php`
-- `prototype/campuspool-extension/Mobility/Commute/CommuteController.php`
-- `prototype/campuspool-extension/routes/commute.php`
-- `prototype/tests/extension/MobilityCommuteProductTest.php`
+1. Add focused regression tests for self-booking, unauthorized acceptance and last-seat contention.
+2. Investigate and fix the migration failure seen in the application CI on workspace PR #3, if reproducible.
+3. Finalize reproducible booking demonstration evidence and the one-minute Sprint 1 video.
 
-## Actual contribution required
+**Relevant code:** `prototype/campuspool-extension/Mobility/Commute/CommuteService.php`, `prototype/campuspool-extension/Mobility/Commute/CommuteController.php`, `prototype/tests/extension/`, `.github/workflows/application.yml`
 
-1. Add dedicated runtime regressions for self-booking, foreign-driver actions, and competing requests for the last seat.
-2. Verify failures do not change capacity or create duplicate bookings.
-3. Coordinate any shared route/service edits and capture integration evidence.
+**Verification:** Run `cd prototype && sh reproduction/verify-package.sh` using its isolated database; capture the real outcome.
 
-## Verification
-
-The full verifier creates and removes **its own** temporary Docker Compose database/volume and must never be pointed at the original running MobilityPlatform database.
+## Pull request
+Commit only files you **actually change** and any associated tests; don't re-add the imported Carpoolear backend or generated `vendor/` files.
 
 ```sh
-cd prototype && sh reproduction/verify-package.sh
+git status --short
+git add <your-changed-files>
+git commit -m "test: verify booking authorization and capacity"
+git push -u origin s1/arjun-booking-release
 ```
 
-## PR handoff
-
-- Submit a **real change**, not a commit containing only unchanged copied code.
-- Suggested PR title: `test: cover booking authorization and capacity contention`.
-- Link the full official issue URLs and distinguish satisfied criteria from remaining ones.
-- Supply tests run, test output and reproducible evidence.
-- Never mark the entire issue Done if other acceptance criteria remain unfinished.
-- Coordinate edits to shared controllers/routes/migrations with the responsible owner.
-- Request an independent teammate review before merge.
+Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
