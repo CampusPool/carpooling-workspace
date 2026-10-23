@@ -9,7 +9,7 @@ services:
     volumes:
       - campuspool_sprint1_db:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-psmoke-root-password"]
+      test: ["CMD", "mysql", "--protocol=TCP", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-psmoke-root-password", "-e", "SELECT 1"]
       interval: 5s
       timeout: 5s
       retries: 20
