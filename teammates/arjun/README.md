@@ -24,7 +24,7 @@ If you have already cloned, update `main` and make your feature branch there; do
 ## Assigned work
 
 1. Add focused regression tests for self-booking, unauthorized acceptance and last-seat contention.
-2. Investigate and fix the migration failure seen in the application CI on workspace PR #3, if reproducible.
+2. Check current workspace CI after the MySQL TCP readiness fix; investigate any **new** failure using migration and database logs, and record the actual result.
 3. Finalize reproducible booking demonstration evidence and the one-minute Sprint 1 video.
 
 **Relevant code:** `prototype/campuspool-extension/Mobility/Commute/CommuteService.php`, `prototype/campuspool-extension/Mobility/Commute/CommuteController.php`, `prototype/tests/extension/`, `.github/workflows/application.yml`
