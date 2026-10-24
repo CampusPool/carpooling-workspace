@@ -30,8 +30,8 @@ final class CommuteService {
   if(isset($v['name'])){$u->name=$v['name'];$u->save();}unset($v['name']);$v['onboarding_complete']=true;
   DB::table('mobility_commute_profiles')->updateOrInsert(['user_id'=>$u->id],['preferences'=>json_encode($v,JSON_THROW_ON_ERROR),'created_at'=>now(),'updated_at'=>now()]);return$this->me($u);
  }
- public function rides(User$rider,string$direction,string$date,string$vehicle,string$pickupChoice='both'):array {
-  return app(CommuteMatchingService::class)->rides($rider,$direction,$date,$vehicle,$pickupChoice);
+ public function rides(User$rider,string$direction,string$date,string$vehicle,string$pickupChoice='both',string$startTime='',string$endTime=''):array {
+  return app(CommuteMatchingService::class)->rides($rider,$direction,$date,$vehicle,$pickupChoice,$startTime,$endTime);
  }
  private function quoteToken(object$m,User$u):string{return hash_hmac('sha256',$m->trip_id.':'.$u->id.':'.$m->fare_minor.':'.$m->fixture_key,(string)config('app.key'));}
  public function request(User$u,int$tripId,string$quote):array {
