@@ -3,11 +3,11 @@
 **GitHub:** @zayaan-06 · **Issues:** [#12](https://github.com/CampusPool/carpooling/issues/12), [#21](https://github.com/CampusPool/carpooling/issues/21) · **Focus:** Driver details, ride offers and browser UX
 
 ## Start and submit
-Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app. **Use the official repository** and verify its latest CI.
 
 ```sh
-git clone https://github.com/CampusPool/carpooling-workspace.git
-cd carpooling-workspace
+git clone https://github.com/CampusPool/carpooling.git
+cd carpooling
 git switch main
 git pull --ff-only origin main
 git switch -c s1/zayaan-web-commute
@@ -21,7 +21,7 @@ cd ..  # back to repository root
 
 If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
 
-## Assigned work
+**Existing PR #51 currently drops required `start_time` / `end_time` search parameters. Repair this regression, preserve Nikhil’s two-time search contract, and add the actual UI fallback/tests before marking the feature done. Do not merge PR #51 in its old form.**\n\n## Assigned work
 
 1. When the map provider is unavailable, show a useful text route/pickup summary, not just a failure message.
 2. Test car/bike offer form validation and driver/rider journey status on small/desktop screens.
@@ -43,4 +43,4 @@ git commit -m "fix: handle commute map failures clearly"
 git push -u origin s1/zayaan-web-commute
 ```
 
-Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
+Open a PR **into `CampusPool/carpooling:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. Review and merge approved contributions in the official [SE + DBMS repository](https://github.com/CampusPool/carpooling). The workspace is now a reference copy, not the PR destination. No teammate should claim copied baseline code as their new contribution.
