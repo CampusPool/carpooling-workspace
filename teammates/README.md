@@ -1,7 +1,7 @@
 # Sprint 1 teammate handoff
 
 **Official SE + DBMS repository:** [CampusPool/carpooling](https://github.com/CampusPool/carpooling) (issues, sprint plan, final source and submission).  
-**Working repository:** [CampusPool/carpooling-workspace](https://github.com/CampusPool/carpooling-workspace) (prototype and teammate PRs).
+**Reference workspace:** [CampusPool/carpooling-workspace](https://github.com/CampusPool/carpooling-workspace) (historical prototype and task sheets; do not open new feature PRs here).
 
 | Contributor | Sprint 1 issues | Story points | Instructions |
 |---|---|---:|---|
@@ -10,14 +10,26 @@
 | Nikhil | [#22](https://github.com/CampusPool/carpooling/issues/22), [#43](https://github.com/CampusPool/carpooling/issues/43) | 10 | [Nikhil](nikhil/README.md) — matching and testing |
 | Nithesh | [#24](https://github.com/CampusPool/carpooling/issues/24), [#37](https://github.com/CampusPool/carpooling/issues/37) | 10 | [Nithesh](nithesh/README.md) — cancellation and DB integrity |
 
-## Workflow
+## Workflow — official source of truth (25 October 2026)
 
-1. Clone **the whole workspace repository**, not a `teammates/` subfolder. These folders contain task instructions, not separate applications.
-2. Run the [portable demo](../prototype/reproduction/PORTABLE_DEMO.md) from `prototype/` and read your own task packet.
-3. Create a personal `s1/...` branch from current workspace `main`. The old `import/sprint1-attributed-sanitized` branch was already merged.
-4. Make and test a **real** code/test change in your assigned area. Commit only your actual files; do not recreate the imported baseline.
-5. Push to `CampusPool/carpooling-workspace` and open a concise PR to its `main`, linking full issue URLs in the official repository.
-6. Get a teammate review. Accepted code is later synchronized to `CampusPool/carpooling` for the official submission.
+1. Clone **the official repository** (not this workspace or an instruction subfolder):
+
+   ```sh
+   git clone https://github.com/CampusPool/carpooling.git
+   cd carpooling
+   git switch main
+   git pull --ff-only origin main
+   cd prototype
+   sh reproduction/start-local.sh
+   python3 reproduction/smoke-booking.py
+   sh reproduction/stop-local.sh
+   cd ..
+   ```
+2. Create your assigned `s1/...` branch from the updated **official `main`**; never commit directly to `main`.
+3. Write and test **your actual** assigned code and/or regression tests. Imported Carpoolear files, previous extension code and central CI repairs are baseline, not individual contributions.
+4. Update package `SOURCE_MAP.tsv` entries for intentionally changed files, regenerate `MANIFEST.sha256` with `cd prototype && python3 scripts/check-package.py --write`, then verify using `python3 scripts/check-package.py` and relevant tests. Do not disable integrity checks.
+5. Push your branch to **CampusPool/carpooling** and open a concise PR targeting **`CampusPool/carpooling:main`**, linked to your official issues. Include exact test results and request a teammate review.
+6. The shared workspace remains a reference to early prototype development; it is **not** the feature PR destination after official baseline PR #46 and central CI repair PR #52.
 
 **Demo:** `cd prototype && sh reproduction/start-local.sh`, then `http://127.0.0.1:18180/mobility/?demo=campus-route`. It uses synthetic routing and demo credits, not live traffic or real money.
 
