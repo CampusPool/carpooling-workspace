@@ -1,4 +1,4 @@
-# CampusPool — team development workspace
+# CampusPool — team development workspace\n\n> **CURRENT TEAM WORKFLOW — 25 OCTOBER 2026:** The canonical, CI-repaired source is [CampusPool/carpooling](https://github.com/CampusPool/carpooling), following baseline PR #46 and repair PR #52. **Clone that official repository, branch from its main, and submit individual PRs there.** This workspace is an earlier reference copy and may be behind official main. [Updated individual task sheets](teammates/README.md). The older workspace-clone/PR instructions further down this README are historical and superseded.\n
 
 **Campus carpooling / bikepooling prototype for the SE + DBMS coursework at PES University.**
 
