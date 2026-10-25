@@ -3,11 +3,11 @@
 **GitHub:** @NikhilJoshi441 · **Issues:** [#22](https://github.com/CampusPool/carpooling/issues/22), [#43](https://github.com/CampusPool/carpooling/issues/43) · **Focus:** Ride search and Test Plan execution
 
 ## Start and submit
-Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app. **Use the official repository** and verify its latest CI.
 
 ```sh
-git clone https://github.com/CampusPool/carpooling-workspace.git
-cd carpooling-workspace
+git clone https://github.com/CampusPool/carpooling.git
+cd carpooling
 git switch main
 git pull --ff-only origin main
 git switch -c s1/nikhil-matching
@@ -21,7 +21,7 @@ cd ..  # back to repository root
 
 If you have already cloned, update `main` and make your feature branch there; do not reclone or reset uncommitted work.
 
-## Assigned work
+**The shared time-window API changes and CI compatibility fixes are already on official main via PR #52. Preserve them and contribute further verifiable matching/test-plan evidence in your own branch.**\n\n## Assigned work
 
 1. Test date/direction/vehicle mismatches, full or unpublished offers, stale quotes and route-provider failures.
 2. Record results against the approved Test Plan; coordinate booking and cancellation tests with the respective owners.
@@ -43,4 +43,4 @@ git commit -m "test: cover ride matching boundaries"
 git push -u origin s1/nikhil-matching
 ```
 
-Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
+Open a PR **into `CampusPool/carpooling:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. Review and merge approved contributions in the official [SE + DBMS repository](https://github.com/CampusPool/carpooling). The workspace is now a reference copy, not the PR destination. No teammate should claim copied baseline code as their new contribution.
