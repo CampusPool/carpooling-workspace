@@ -1,4 +1,4 @@
-# Contributing to CampusPool
+# Contributing to CampusPool\n\n> **Current rule (25 October 2026):** Start from [official CampusPool/carpooling](https://github.com/CampusPool/carpooling) `main` and submit feature PRs to **`CampusPool/carpooling:main`**. Workspace PR instructions below describe the earlier distribution process and are superseded. Do not claim another contributor's/agent's changes as your own.\n
 
 **Where to work:** [CampusPool/carpooling-workspace](https://github.com/CampusPool/carpooling-workspace) contains the runnable baseline and is the destination for teammate feature PRs. [CampusPool/carpooling](https://github.com/CampusPool/carpooling) contains the official issues, sprint board and final assessed source. Read [the main README](README.md) and your [role-specific task sheet](teammates/README.md) before changing code.
 
