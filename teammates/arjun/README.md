@@ -3,11 +3,11 @@
 **GitHub:** @arjunsrikanthh · **Issues:** [#23](https://github.com/CampusPool/carpooling/issues/23), [#39](https://github.com/CampusPool/carpooling/issues/39), [#44](https://github.com/CampusPool/carpooling/issues/44) · **Focus:** Booking correctness, CI and demo evidence
 
 ## Start and submit
-Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app.
+Clone the **whole repository**, not a teammate subfolder. Each subfolder is an instruction sheet, not a standalone app. **Use the official repository** and verify its latest CI.
 
 ```sh
-git clone https://github.com/CampusPool/carpooling-workspace.git
-cd carpooling-workspace
+git clone https://github.com/CampusPool/carpooling.git
+cd carpooling
 git switch main
 git pull --ff-only origin main
 git switch -c s1/arjun-booking-release
@@ -43,4 +43,4 @@ git commit -m "test: verify booking authorization and capacity"
 git push -u origin s1/arjun-booking-release
 ```
 
-Open a PR **into `CampusPool/carpooling-workspace:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. PRs from the shared workspace will be integrated into the official [SE + DBMS repository](https://github.com/CampusPool/carpooling) only after review. No teammate should claim copied baseline code as their new contribution.
+Open a PR **into `CampusPool/carpooling:main`**. Link the full official issue URLs, state what changed and tests actually run, and request teammate review. Review and merge approved contributions in the official [SE + DBMS repository](https://github.com/CampusPool/carpooling). The workspace is now a reference copy, not the PR destination. No teammate should claim copied baseline code as their new contribution.
